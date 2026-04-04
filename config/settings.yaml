@@ -1,0 +1,18 @@
+# Default configuration — loaded at app startup
+# Override via environment variables or .env file
+
+default:
+  provider: ollama
+  model: llama3
+  embedding_model: nomic-embed-text
+  ollama_base_url: http://localhost:11434
+  temperature: 0.7
+  max_tokens: 2048
+
+development:
+  debug: true
+  log_level: DEBUG
+
+production:
+  debug: false
+  log_level: WARNING

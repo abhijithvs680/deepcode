@@ -1,0 +1,44 @@
+
+services:
+  # ── FastAPI Application ──────────────────────────────────────────────────
+  api:
+    build: .
+    container_name: deepcode_api
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # Uses asyncpg driver — must match our SQLAlchemy engine
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/deepcode
+      - LLM_PROVIDER=ollama
+      - LLM_MODEL=llama3.1:latest
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+      - EMBEDDING_MODEL=nomic-embed-text
+      - LOG_LEVEL=INFO
+    volumes:
+      - .:/app
+    restart: unless-stopped
+
+  # ── PostgreSQL Database ──────────────────────────────────────────────────
+  db:
+    image: ankane/pgvector:latest
+    container_name: deepcode_db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: deepcode
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

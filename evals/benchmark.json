@@ -1,0 +1,17 @@
+[
+  {
+    "query": "Who last modified the authentication module?",
+    "expected_tool": "git",
+    "type": "tool"
+  },
+  {
+    "query": "Show recent errors in application logs",
+    "expected_tool": "log",
+    "type": "tool"
+  },
+  {
+    "query": "Explain how the orchestrator coordinates agents",
+    "type": "rag",
+    "expected_keywords": ["orchestrator", "agent"]
+  }
+]
