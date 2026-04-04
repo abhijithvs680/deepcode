@@ -61,7 +61,7 @@ class Settings(BaseSettings):
     GIT_QUERY_HINTS_CAP: int = 12
 
     # ── Database ──────────────────────────────────────────────────────────
-    DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/deepcode"
+    DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/deepcode"
 
     # ── Logging ───────────────────────────────────────────────────────────
     LOG_LEVEL: str = "INFO"
