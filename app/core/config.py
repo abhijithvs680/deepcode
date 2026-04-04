@@ -4,6 +4,7 @@ Central configuration using Pydantic Settings.
 Loads values from environment variables → .env file → defaults.
 """
 from functools import lru_cache
+import os
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -12,7 +13,7 @@ class Settings(BaseSettings):
     """Application settings — single source of truth."""
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=os.path.expanduser("~/.deepcode.env"),
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
