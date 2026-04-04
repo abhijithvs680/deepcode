@@ -45,6 +45,7 @@ class AgentOrchestrator:
         mode: str = "ask",
         auto_apply: bool = False,
         dry_run: bool = False,
+        **kwargs,
     ) -> dict:
         from app.core.debug_trace import DebugTrace
 
