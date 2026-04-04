@@ -171,6 +171,7 @@ class DeepCodeTuiApp(App):
     def _append_trace(self, markup: str) -> None:
         self._trace_scroll().mount(Static(markup, classes="chat-line"))
 
+    @work
     async def action_command_palette(self) -> None:
         result = await self.push_screen_wait(CommandPaletteScreen())
         if result is not None:
@@ -188,7 +189,7 @@ class DeepCodeTuiApp(App):
     async def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "input" and event.value == "/":
             event.input.value = ""
-            await self.action_command_palette()
+            self.action_command_palette()
 
     def action_clear_chat(self) -> None:
         self._clear_chat_only()
