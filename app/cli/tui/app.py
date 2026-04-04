@@ -74,8 +74,15 @@ class IngestionLoaderScreen(ModalScreen):
     @work
     async def run_ingestion(self) -> None:
         from app.core.repo_manager import resolve_and_prepare_repo_async
+        
+        def _echo(msg: str) -> None:
+            try:
+                self.query_one("#ingest-status", Static).update(msg)
+            except Exception:
+                pass
+
         # Synchronous execution bound safely within Textual Worker
-        repo_path, repo_id = await resolve_and_prepare_repo_async(self.raw_repo_input, echo=lambda m: None)
+        repo_path, repo_id = await resolve_and_prepare_repo_async(self.raw_repo_input, echo=_echo)
         self.app.apply_repo_context(repo_id, repo_path)
         self.dismiss()
 
