@@ -101,9 +101,6 @@ class DeepCodeTuiApp(App):
     Static.chat-line {
         margin-bottom: 1;
         height: auto;
-    Static.chat-line {
-        margin-bottom: 1;
-        height: auto;
     }
     #diff-dialog {
         background: $surface;
