@@ -23,8 +23,15 @@ _db_logger = get_logger(__name__)
 settings = get_settings()
 
 # ── Engine ─────────────────────────────────────────────────────────────────────
+# Ensure the async driver is used even if the user provides a sync database URL.
+_db_url = settings.DATABASE_URL
+if _db_url.startswith("postgres://"):
+    _db_url = _db_url.replace("postgres://", "postgresql+asyncpg://", 1)
+elif _db_url.startswith("postgresql://"):
+    _db_url = _db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+
 engine = create_async_engine(
-    settings.DATABASE_URL,
+    _db_url,
     echo=settings.DEBUG,
     pool_size=5,
     max_overflow=10,
