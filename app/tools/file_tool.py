@@ -66,17 +66,43 @@ class FileTool(Tool):
         except Exception as e:
             return ToolResult(tool=self.name, action="read_file", success=False, error=str(e))
 
-    async def search(self, query: str, file_path: Optional[str] = None) -> ToolResult:
+    async def search(
+        self,
+        query: str = "",
+        queries: Optional[list[str]] = None,
+        file_path: Optional[str] = None,
+    ) -> ToolResult:
         """
-        Basic regex evaluation parsing keyword constraints dynamically avoiding heavy RAG ANN overheads.
+        Basic grep-like search. Pass `queries` for multiple terms (OR, deduped by file+line);
+        otherwise a single `query` string is used (legacy).
         """
-        # A simple grep-like operation over the root bounds
-        matches = []
+        import re
+
+        terms: list[str] = []
+        if queries:
+            for q in queries:
+                t = (q or "").strip()
+                if len(t) >= 2:
+                    terms.append(t)
+        raw = (query or "").strip()
+        if raw and raw not in terms:
+            # avoid duplicating if same as a cleaned term
+            if not any(raw.lower() == x.lower() for x in terms):
+                terms.append(raw)
+
+        if not terms:
+            return ToolResult(
+                tool=self.name,
+                action="search",
+                success=True,
+                data={"matches": []},
+                metadata={"total_matches_evaluated": 0, "search_terms": []},
+            )
+
+        matches: list[dict] = []
+        seen_lines: set[tuple[str, int]] = set()
         try:
-            import re
-            pattern = re.compile(re.escape(query), re.IGNORECASE)
-            
-            target_files = []
+            target_files: list[str] = []
             if file_path:
                 fp = self._resolve_path(file_path)
                 if os.path.exists(fp):
@@ -86,24 +112,39 @@ class FileTool(Tool):
                     for f in files:
                         if f.endswith((".py", ".md", ".json", ".yml", ".yaml")):
                             target_files.append(os.path.join(root, f))
-                            
+
+            patterns = [re.compile(re.escape(t), re.IGNORECASE) for t in terms]
+
             for path in target_files:
                 try:
                     with open(path, "r", encoding="utf-8", errors="replace") as f:
                         lines = f.readlines()
-                        for i, line in enumerate(lines):
-                            if pattern.search(line):
-                                rel_path = os.path.relpath(path, self.workspace_root)
-                                matches.append({"file": rel_path, "line_no": i + 1, "content": line.strip()})
-                except:
+                    for i, line in enumerate(lines):
+                        if any(p.search(line) for p in patterns):
+                            rel_path = os.path.relpath(path, self.workspace_root)
+                            key = (rel_path, i + 1)
+                            if key in seen_lines:
+                                continue
+                            seen_lines.add(key)
+                            matches.append(
+                                {"file": rel_path, "line_no": i + 1, "content": line.strip()}
+                            )
+                            if len(matches) >= 50:
+                                break
+                except OSError:
                     continue
+                if len(matches) >= 50:
+                    break
 
             return ToolResult(
-                tool=self.name, 
-                action="search", 
-                success=True, 
-                data={"matches": matches[:50]}, # Capping matrix to save tokens
-                metadata={"total_matches_evaluated": len(matches)}
+                tool=self.name,
+                action="search",
+                success=True,
+                data={"matches": matches},
+                metadata={
+                    "total_matches_evaluated": len(matches),
+                    "search_terms": terms[:12],
+                },
             )
         except Exception as e:
             return ToolResult(tool=self.name, action="search", success=False, error=str(e))

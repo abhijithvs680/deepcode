@@ -359,10 +359,11 @@ class AgentOrchestrator:
                     if node_name == "ParallelRetrieval":
                         rc = float(state.get("router_confidence") or 0.0)
                         tool_conf_high = rc > 0.90
-                        # Phase 5: Bypass RAG only for query types where deterministic tools
-                        # are genuinely sufficient (git, navigation). Architecture/factual
-                        # queries always need semantic RAG context.
-                        rag_bypass_types = {"git", "navigation"}
+                        # Phase 5: Bypass RAG only when a deterministic tool is sufficient.
+                        # Do not bypass "navigation": the router often picks `file`, and
+                        # FileTool.search uses the raw query as a literal grep — natural
+                        # language questions then skip RAG and return empty matches.
+                        rag_bypass_types = {"git"}
                         if state.get("force_tool") or (tool_conf_high and q_type in rag_bypass_types):
                             logger.info(f"[Orchestrator] Bypass Phase 5 rules matched (tool_conf={rc}, type={q_type}). Tracing exclusively over Tool execution limits!")
                             try:
