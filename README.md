@@ -26,9 +26,39 @@ The framework relies upon a modular Node DAG architecture bridging context depen
 - **Dynamic Context Building:** Extracts explicit Python AST metadata matching explicit class dependencies natively.
 - **Privacy-First Native LLMs:** Operates explicitly across standard local instances mapping targets onto `nomic-embed-text` and `llama` variations via Ollama bindings!
 
+## ⚖️ Why DeepCode? (Advantages vs Copilot, Cursor, & Aider)
+
+While tools like GitHub Copilot, Cursor, and OpenDevin provide excellent LLM-based coding assistance, DeepCode is engineered specifically with these core advantages:
+
+1. **Absolute Data Privacy (100% Local)**: DeepCode executes entirely on your own hardware. Your proprietary source code never leaves your network and is never transmitted to OpenAI, Microsoft, or Anthropic. 
+2. **Persistent Cognitive Memory (`pgvector`)**: Standard editor tools rely on tiny spatial context windows. DeepCode natively utilizes asynchronous PostgreSQL instances mapping structured memory vectors dynamically across your whole architecture. 
+3. **Execution Sandbox Boundaries**: Unlike naive agents that hallucinate brute-force terminal destruction, DeepCode strictly limits explicit operations mapping Git diffs, log traces, and File manipulations within validated sandboxes natively.
+4. **Deterministic Critic Loops**: Instead of "generation -> pass" paradigms, DeepCode intrinsically mounts a Critic validation cycle checking explicit output logic before execution, plummeting hallucinated outputs reliably.
+
+---
+
+## ⚙️ System Dependencies
+
+DeepCode operates locally but requires specific engine primitives to run. Ensure you have the following installed before bootstrapping:
+
+1. **Python 3.11+**: The core execution engine.
+2. **PostgreSQL & `pgvector`**: Drives all semantic storage, memory bounds, and code indexing algorithms natively. We highly recommend docker-compose for this setup.
+3. **Ollama**: Acts as the local inference provider mapping dependencies to open-source models like `llama3.1:latest` and `nomic-embed-text` safely!
+
 ---
 
 ## 🔧 Installation (Recommended)
+
+### Spin up the Database & LLM Endpoints
+First, ensure your memory engine (`pgvector`) and local models are actively running:
+```bash
+# 1. Spin up the asynchronous pgvector database
+docker-compose up -d
+
+# 2. Ensure Ollama models are pulled and available
+ollama run llama3.1
+ollama pull nomic-embed-text
+```
 
 ### Install globally using `pipx`
 `pipx` ensures DeepCode operates safely globally across your entire OS avoiding local standard `venv` conflicts.
@@ -38,7 +68,13 @@ pip install pipx
 pipx ensurepath
 
 # Install strictly binding the standard Git repository:
-pipx install git+https://github.com/your-org/deepcode-agent.git
+pipx install git+https://github.com/abhijithvs680/deepcode.git
+```
+
+### Apply Table Schemas & Init
+You explicitly bind initial vector parameters by executing:
+```bash
+deepcode init-db
 ```
 
 ### Run from anywhere
@@ -56,7 +92,3 @@ pipx upgrade deepcode
 
 > [!WARNING]
 > ⚠ Using `virtualenv` manually is NOT recommended for CLI end-usage natively! Explicitly rely on `pipx` for safe bounding globally.
-```bash
-docker-compose up -d
-deepcode init-db
-```
