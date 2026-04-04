@@ -9,7 +9,9 @@ from textual.widgets import Label, OptionList
 
 # (value inserted into input or executed prefix, description)
 PALETTE_ENTRIES: list[tuple[str, str]] = [
-    ("/ask ", "Ask a standard question"),
+    ("/build ", "Modify code, apply patches, and run tests"),
+    ("/plan ", "Create an implementation plan without writing"),
+    ("/ask ", "Ask a standard question (Default)"),
     ("/open ", "Open/View a specific file"),
     ("/find ", "Search for a symbol or text"),
     ("/explain ", "Explain a function or component"),
