@@ -86,7 +86,7 @@ Query: {query}
             res = await self.provider.generate(
                 prompt=prompt,
                 system_prompt="You are a strict JSON classifier.",
-                model=self.settings.ROUTER_MODEL,
+                model=getattr(self.settings, "LLM_ROUTER_MODEL", self.settings.LLM_MODEL),
                 temperature=0.0
             )
             val = json.loads(res.strip("` \n").removeprefix("json\n"))

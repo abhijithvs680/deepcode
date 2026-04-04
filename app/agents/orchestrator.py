@@ -359,8 +359,11 @@ class AgentOrchestrator:
                     if node_name == "ParallelRetrieval":
                         rc = float(state.get("router_confidence") or 0.0)
                         tool_conf_high = rc > 0.90
-                        # Phase 5: Complete bypass mapped explicitly preventing slow semantic queries
-                        if state.get("force_tool") or tool_conf_high or q_type == "git":
+                        # Phase 5: Bypass RAG only for query types where deterministic tools
+                        # are genuinely sufficient (git, navigation). Architecture/factual
+                        # queries always need semantic RAG context.
+                        rag_bypass_types = {"git", "navigation"}
+                        if state.get("force_tool") or (tool_conf_high and q_type in rag_bypass_types):
                             logger.info(f"[Orchestrator] Bypass Phase 5 rules matched (tool_conf={rc}, type={q_type}). Tracing exclusively over Tool execution limits!")
                             try:
                                 agent = AgentRegistry.get("ToolExecutor")

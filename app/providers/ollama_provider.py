@@ -29,7 +29,15 @@ class OllamaProvider(LLMProvider):
         self._timeout = httpx.Timeout(120.0, connect=10.0)
 
     # ── LLMProvider interface ─────────────────────────────────────────────
-    async def generate(self, prompt: str, model: str | None = None) -> str:
+    async def generate(
+        self,
+        prompt: str,
+        model: str | None = None,
+        *,
+        system_prompt: str | None = None,
+        temperature: float | None = None,
+        **kwargs,
+    ) -> str:
         """Send a prompt to Ollama and return the generated text."""
         url = f"{self.base_url}/api/generate"
         target_model = model or self.model
@@ -38,10 +46,12 @@ class OllamaProvider(LLMProvider):
             "prompt": prompt,
             "stream": False,
             "options": {
-                "temperature": settings.LLM_TEMPERATURE,
+                "temperature": temperature if temperature is not None else settings.LLM_TEMPERATURE,
                 "num_predict": settings.LLM_MAX_TOKENS,
             },
         }
+        if system_prompt:
+            payload["system"] = system_prompt
 
         logger.info("Ollama generate → model=%s", target_model)
 

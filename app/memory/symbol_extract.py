@@ -8,6 +8,12 @@ _SYMBOL_STOPWORDS = frozenset({
     "session", "model", "object", "string", "import", "return", "class", "function",
     "def", "what", "does", "how", "where", "when", "which", "this", "that", "with",
     "from", "into", "about", "file", "code", "test", "tests", "the", "and", "for",
+    "explain", "describe", "show", "list", "find", "get", "set", "all", "each",
+    "every", "some", "any", "base", "main", "help", "give", "tell", "work",
+    "works", "working", "used", "using", "make", "create", "update", "delete",
+    "can", "will", "should", "would", "could", "have", "has", "been", "are",
+    "was", "were", "not", "but", "also", "then", "than", "like", "just",
+    "only", "very", "most", "such", "much", "well", "here", "there",
 })
 
 
@@ -25,6 +31,9 @@ def extract_query_identifiers(query: str) -> list[str]:
             if len(s) < 2:
                 continue
             key = s.lower()
+            # Skip generic English words that pollute code-symbol expansion
+            if key in _SYMBOL_STOPWORDS:
+                continue
             if key not in seen:
                 seen.add(key)
                 out.append(s)
