@@ -13,7 +13,7 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import Footer, Header, Input, Static, Button, RichLog
+from textual.widgets import Footer, Header, Input, Static, Button, RichLog, LoadingIndicator
 from textual.screen import ModalScreen
 
 class ConfirmDiffScreen(ModalScreen[bool]):
@@ -44,6 +44,40 @@ from app.cli.commands.ask import run_ask_async
 from app.cli.tui.widgets import chat as chatfmt
 from app.cli.tui.widgets.command_palette import CommandPaletteScreen
 from app.core.config import get_settings
+
+class IngestionLoaderScreen(ModalScreen):
+    CSS = """
+    #ingestion-dialog {
+        background: $surface;
+        border: thick $primary;
+        width: 70%;
+        height: 50%;
+        align: center middle;
+        padding: 2;
+        content-align: center middle;
+    }
+    """
+    
+    def __init__(self, raw_repo_input: str | None):
+        super().__init__()
+        self.raw_repo_input = raw_repo_input
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="ingestion-dialog"):
+            yield Static("🚀 [bold magenta]Initializing DeepCode Repository[/bold magenta]", id="ingest-title", classes="panel-title")
+            yield LoadingIndicator()
+            yield Static("Scanning file trees, compiling symbols, extracting embeddings...", id="ingest-status")
+
+    async def on_mount(self) -> None:
+        self.run_ingestion()
+        
+    @work
+    async def run_ingestion(self) -> None:
+        from app.core.repo_manager import resolve_and_prepare_repo_async
+        # Synchronous execution bound safely within Textual Worker
+        repo_path, repo_id = await resolve_and_prepare_repo_async(self.raw_repo_input, echo=lambda m: None)
+        self.app.apply_repo_context(repo_id, repo_path)
+        self.dismiss()
 
 settings = get_settings()
 TRACE_DIR = Path(".ai_assistant/logs")
@@ -122,12 +156,12 @@ class DeepCodeTuiApp(App):
     def __init__(
         self,
         *,
-        repo_id: str | None = None,
-        repo_path: str | None = None,
+        raw_repo_input: str | None = None,
     ) -> None:
         super().__init__()
-        self._repo_id = repo_id
-        self._repo_path = repo_path
+        self.raw_repo_input = raw_repo_input
+        self._repo_id = None
+        self._repo_path = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -145,18 +179,27 @@ class DeepCodeTuiApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
+        self.query_one("#input", Input).focus()
+        # Immediately invoke blocking overlay preventing UI bypasses
+        self.push_screen(IngestionLoaderScreen(self.raw_repo_input))
+        
+    def apply_repo_context(self, repo_id: str, repo_path: str) -> None:
+        self._repo_id = repo_id
+        self._repo_path = repo_path
         if self._repo_path:
             label = Path(self._repo_path).name
             self.sub_title = f"{settings.LLM_MODEL} | {label}"
-        self.query_one("#input", Input).focus()
+            
         rid = escape(self._repo_id or "(none)")
         rp = escape(self._repo_path or "")
+        
         self._set_trace_text(
             f"[dim]repo_id:[/dim] {rid}\n[dim]path:[/dim] {rp}\n\n"
             "[dim]Pipeline meta and trace appear here after each reply. "
             "Try /metrics or /trace.[/dim]"
         )
-
+        self._mount_chat(chatfmt.system_block(f"[bold green]✓ Ingestion Complete.[/bold green] Repository indexed implicitly!"))
+        
     def _chat_scroll(self) -> VerticalScroll:
         return self.query_one("#chat-scroll", VerticalScroll)
 
@@ -421,7 +464,6 @@ class DeepCodeTuiApp(App):
 
 def run_tui(
     *,
-    repo_id: str | None = None,
-    repo_path: str | None = None,
+    raw_repo_input: str | None = None,
 ) -> None:
-    DeepCodeTuiApp(repo_id=repo_id, repo_path=repo_path).run()
+    DeepCodeTuiApp(raw_repo_input=raw_repo_input).run()

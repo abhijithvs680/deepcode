@@ -102,7 +102,7 @@ def _clone_repo(url: str, dest: Path) -> None:
     Repo.clone_from(url, str(dest), depth=1)
 
 
-def schedule_ingest(
+async def execute_ingest(
     repo_path: str,
     repo_id: str,
     chunk_size: int,
@@ -112,33 +112,26 @@ def schedule_ingest(
     head_hash: str | None,
     clear_first: bool = False
 ) -> None:
-    async def task():
-        try:
-            INGEST_STATUS[repo_id] = {
-                "status": "running",
-                "started_at": datetime.now(timezone.utc).isoformat()
-            }
-            inserted = await ingest_repository(
-                repo_path,
-                repo_id,
-                clear=clear_first,
-                chunk_size=chunk_size,
-                overlap=overlap,
-                max_source_files=cap,
-            )
-            echo(f"   [Background] Ingest complete ({inserted} chunks).")
-            from app.core.repo_registry import update_repo_registry
-            update_repo_registry(repo_id, repo_path, head_hash, index_version=1)
-            INGEST_STATUS[repo_id] = {"status": "done", "finished_at": datetime.now(timezone.utc).isoformat()}
-        except Exception as e:
-            logger.error(f"Ingest failed: {e}")
-            INGEST_STATUS[repo_id] = {"status": "failed", "error": str(e)}
-
     try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(task())
-    except RuntimeError:
-        asyncio.run(task())
+        INGEST_STATUS[repo_id] = {
+            "status": "running",
+            "started_at": datetime.now(timezone.utc).isoformat()
+        }
+        inserted = await ingest_repository(
+            repo_path,
+            repo_id,
+            clear=clear_first,
+            chunk_size=chunk_size,
+            overlap=overlap,
+            max_source_files=cap,
+        )
+        echo(f"   [Foreground] Ingest complete ({inserted} chunks).")
+        from app.core.repo_registry import update_repo_registry
+        update_repo_registry(repo_id, repo_path, head_hash, index_version=1)
+        INGEST_STATUS[repo_id] = {"status": "done", "finished_at": datetime.now(timezone.utc).isoformat()}
+    except Exception as e:
+        logger.error(f"Ingest failed: {e}")
+        INGEST_STATUS[repo_id] = {"status": "failed", "error": str(e)}
 
 
 async def prepare_remote_repo_async(
@@ -179,11 +172,11 @@ async def prepare_remote_repo_async(
     current_hash = get_git_head_hash(dest)
 
     if not indexed:
-        echo("   Not indexed — scheduling background ingest…")
-        schedule_ingest(resolved, repo_id, chunk_size, overlap, cap, echo, current_hash, clear_first=False)
+        echo("   Not indexed — executing synchronous TUI ingest…")
+        await execute_ingest(resolved, repo_id, chunk_size, overlap, cap, echo, current_hash, clear_first=False)
     elif current_hash and current_hash != stored_hash:
-        echo("   Stale index detected (git HEAD drift) — scheduling background re-index…")
-        schedule_ingest(resolved, repo_id, chunk_size, overlap, cap, echo, current_hash, clear_first=True)
+        echo("   Stale index detected (git HEAD drift) — executing synchronous TUI re-index…")
+        await execute_ingest(resolved, repo_id, chunk_size, overlap, cap, echo, current_hash, clear_first=True)
     else:
         echo("   Already indexed.")
 
@@ -220,11 +213,11 @@ async def prepare_local_repo_async(
     current_hash = get_git_head_hash(root)
 
     if not indexed:
-        echo("   Not indexed — scheduling background ingest…")
-        schedule_ingest(str(root), repo_id, chunk_size, overlap, cap, echo, current_hash, clear_first=False)
+        echo("   Not indexed — executing synchronous TUI ingest…")
+        await execute_ingest(str(root), repo_id, chunk_size, overlap, cap, echo, current_hash, clear_first=False)
     elif current_hash and current_hash != stored_hash:
-        echo("   Stale index detected (git HEAD drift) — scheduling background re-index…")
-        schedule_ingest(str(root), repo_id, chunk_size, overlap, cap, echo, current_hash, clear_first=True)
+        echo("   Stale index detected (git HEAD drift) — executing synchronous TUI re-index…")
+        await execute_ingest(str(root), repo_id, chunk_size, overlap, cap, echo, current_hash, clear_first=True)
     else:
         echo("   Already indexed.")
 

@@ -79,21 +79,9 @@ app.add_typer(repos_app, name="repos")
 
 def _launch_ui(repo: Optional[str]) -> None:
     from app.cli.tui.app import run_tui
-    from app.core.repo_manager import resolve_and_prepare_repo
 
-    try:
-        path, rid = resolve_and_prepare_repo(repo, echo=typer.echo)
-    except FileNotFoundError as exc:
-        typer.echo(str(exc), err=True)
-        raise typer.Exit(1) from exc
-    except RuntimeError as exc:
-        typer.echo(str(exc), err=True)
-        raise typer.Exit(1) from exc
-    except Exception as exc:
-        typer.echo(f"Repo preparation failed: {exc}", err=True)
-        raise typer.Exit(1) from exc
-
-    run_tui(repo_id=rid, repo_path=path)
+    # Direct transfer avoiding asyncio termination destructing ingestion queries
+    run_tui(raw_repo_input=repo)
 
 
 @app.callback()
