@@ -7,7 +7,7 @@ Welcome to the DeepCode Agent environment framework! This guide dictates explici
 Ensure your machine is explicitly configured executing these dependencies securely:
 1. **Python `3.11+`**: Powers the dynamic DAG pipeline constraints Native OS.
 2. **Docker / Docker Compose**: Tracks the explicit PostgreSQL database embedding vector structures globally.
-3. **Ollama**: Exposes local dependencies binding `llama` models efficiently alongside `nomic-embed-text` variables.
+3. **Ollama**: Exposes local dependencies binding `llama` models efficiently alongside `qwen3-embedding:8b` variables.
 
 ---
 

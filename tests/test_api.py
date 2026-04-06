@@ -96,7 +96,7 @@ class TestAsk:
             "answer": "Hello! I'm DeepCode Agent.",
             "session_id": "test-session-id",
             "latency_ms": 100,
-            "model": "llama3.1:latest",
+            "model": "gemma4:26b",
             "provider": "ollama"
         })
 
@@ -156,7 +156,7 @@ class TestAsk:
             "answer": "Context-aware answer",
             "session_id": "test-session-id",
             "latency_ms": 100,
-            "model": "llama3.1:latest",
+            "model": "gemma4:26b",
             "provider": "ollama"
         })
 

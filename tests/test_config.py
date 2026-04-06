@@ -10,7 +10,7 @@ class TestSettings:
     def test_defaults(self):
         s = Settings()
         assert s.LLM_PROVIDER == "ollama"
-        assert s.LLM_MODEL == "llama3.1:latest"
+        assert s.LLM_MODEL == "gemma4:26b"
         assert s.OLLAMA_BASE_URL == "http://localhost:11434"
         assert s.LLM_TEMPERATURE == 0.7
         assert s.LLM_MAX_TOKENS == 2048

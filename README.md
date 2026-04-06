@@ -24,7 +24,7 @@ The framework relies upon a modular Node DAG architecture bridging context depen
 - **Decoupled Evaluators:** Generates End-To-End metrics strictly evaluating hallucination tracking dynamically scaling Tool usage heuristics across telemetry footprints (`.ai_assistant/logs/`).
 - **Autonomous Cognitive Memory:** Standard `pgvector` matrices continuously log your codebase evolution mapping Developer Intent, Design Patterns, and Context cleanly alongside standard spatial arrays!
 - **Dynamic Context Building:** Extracts explicit Python AST metadata matching explicit class dependencies natively.
-- **Privacy-First Native LLMs:** Operates explicitly across standard local instances mapping targets onto `nomic-embed-text` and `llama` variations via Ollama bindings!
+- **Privacy-First Native LLMs:** Operates explicitly across standard local instances mapping targets onto `qwen3-embedding:8b` and `llama` variations via Ollama bindings!
 
 ## ⚖️ Why DeepCode? (Advantages vs Copilot, Cursor, & Aider)
 
@@ -43,7 +43,7 @@ DeepCode operates locally but requires specific engine primitives to run. Ensure
 
 1. **Python 3.11+**: The core execution engine.
 2. **PostgreSQL & `pgvector`**: Drives all semantic storage, memory bounds, and code indexing algorithms natively. We highly recommend docker-compose for this setup.
-3. **Ollama**: Acts as the local inference provider mapping dependencies to open-source models like `llama3.1:latest` and `nomic-embed-text` safely!
+3. **Ollama**: Acts as the local inference provider mapping dependencies to open-source models like `gemma4:26b` and `qwen3-embedding:8b` safely!
 
 ---
 
@@ -57,7 +57,7 @@ docker-compose up -d
 
 # 2. Ensure Ollama models are pulled and available
 ollama run llama3.1
-ollama pull nomic-embed-text
+ollama pull qwen3-embedding:8b
 ```
 
 ### Install globally using `pipx`

@@ -30,8 +30,8 @@ class Settings(BaseSettings):
 
     # ── LLM Provider ─────────────────────────────────────────────────────
     LLM_PROVIDER: str = "ollama"  # "ollama" | "openai" | "anthropic"
-    LLM_MODEL: str = "llama3.1:latest"
-    LLM_ROUTER_MODEL: str = "llama3.1:latest" # Configured for fast low-latency tasks
+    LLM_MODEL: str = "gemma4:26b"
+    LLM_ROUTER_MODEL: str = "gemma4:26b" # Configured for fast low-latency tasks
     LLM_TEMPERATURE: float = 0.7
     LLM_MAX_TOKENS: int = 2048
 
@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     OLLAMA_BASE_URL: str = "http://localhost:11434"
 
     # ── Embedding ─────────────────────────────────────────────────────────
-    EMBEDDING_MODEL: str = "nomic-embed-text"
+    EMBEDDING_MODEL: str = "qwen3-embedding:8b"
     EMBEDDING_DIMENSION: int = 768
 
     # ── RAG / code intelligence ───────────────────────────────────────────

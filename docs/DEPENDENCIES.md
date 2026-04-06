@@ -28,10 +28,10 @@ This spins up a secure, local-only node of PostgreSQL 15+ preconfigured with the
 
 ## 2. Intelligence Provider (`Ollama`)
 
-As a privacy-focused execution environment, DeepCode does NOT bounce your source code off of OpenAI or Anthropic servers unless explicitly configured. Instead, we rely entirely on **Ollama** explicitly hosting `llama3.1` and `nomic-embed-text` safely!
+As a privacy-focused execution environment, DeepCode does NOT bounce your source code off of OpenAI or Anthropic servers unless explicitly configured. Instead, we rely entirely on **Ollama** explicitly hosting `llama3.1` and `qwen3-embedding:8b` safely!
 
 ### Why Ollama?
-- **Local Embedded Tensors**: Uses `nomic-embed-text` to explicitly chunk code vectors onto the PostgreSQL layer dynamically. 
+- **Local Embedded Tensors**: Uses `qwen3-embedding:8b` to explicitly chunk code vectors onto the PostgreSQL layer dynamically. 
 - **Offline Reasoner Pipeline**: Leverages open-weight LLMs (`llama3.1`) passing execution signatures right through the internal Multi-Agent loop natively bypassing network telemetry loops.
 
 ### Installation & Initialization
@@ -43,7 +43,7 @@ Once Ollama is installed natively on your OS, pull the mandatory execution model
 ollama run llama3.1
 
 # 2. Pull the designated text embedding model
-ollama pull nomic-embed-text
+ollama pull qwen3-embedding:8b
 ```
 
 Ensure the Ollama API is actively listening on `http://localhost:11434` before triggering DeepCode.
