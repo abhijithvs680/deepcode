@@ -558,4 +558,7 @@ def run_tui(
     *,
     raw_repo_input: str | None = None,
 ) -> None:
+    from app.core.logger import quiet_app_loggers_for_tui
+
+    quiet_app_loggers_for_tui()
     DeepCodeTuiApp(raw_repo_input=raw_repo_input).run()

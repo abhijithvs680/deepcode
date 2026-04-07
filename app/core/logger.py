@@ -37,3 +37,30 @@ def get_logger(name: str) -> logging.Logger:
 
     logger.setLevel(getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO))
     return logger
+
+
+def quiet_app_loggers_for_tui() -> None:
+    """
+    Detach stdout/stderr StreamHandlers from `app.*` loggers.
+
+    Logging during a Textual full-screen session corrupts the layout on Windows
+    consoles (log lines paint over the TUI, then the next redraw "fixes" it).
+    """
+    import logging
+    import sys
+
+    streams = (sys.stdout, sys.stderr)
+    for name in list(logging.root.manager.loggerDict.keys()):
+        if not str(name).startswith("app"):
+            continue
+        log = logging.getLogger(name)
+        if not isinstance(log, logging.Logger):
+            continue
+        for h in list(log.handlers):
+            if isinstance(h, logging.StreamHandler):
+                stream = getattr(h, "stream", None)
+                if stream in streams:
+                    log.removeHandler(h)
+        if not log.handlers:
+            log.addHandler(logging.NullHandler())
+            log.propagate = False

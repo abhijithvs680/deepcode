@@ -84,6 +84,9 @@ class Settings(BaseSettings):
     # Repo auto-index (repo_manager / TUI)
     REPO_INDEX_MAX_FILES: int = 5000
 
+    # Orchestrator DAG safety cap (critic retries reset the workflow pointer)
+    ORCHESTRATOR_MAX_ITERATIONS: int = 16
+
 
 @lru_cache()
 def get_settings() -> Settings:

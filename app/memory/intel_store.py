@@ -370,17 +370,51 @@ async def store_query(
     repo_name: str,
     query_text: str,
     response_text: str,
-    query_embedding: list[float] | None = None
+    query_embedding: list[float] | None = None,
 ) -> None:
-    db.add(
-        AgentQueryHistory(
-            repo_name=repo_name,
-            query_text=query_text,
-            response_text=response_text,
-            query_embedding=query_embedding,
+    from app.core.config import get_settings
+
+    st = get_settings()
+    dim = int(getattr(st, "EMBEDDING_DIMENSION", 0) or 0)
+    vec: list[float] | None = None
+    if query_embedding and dim > 0 and len(query_embedding) == dim:
+        vec = query_embedding
+    elif query_embedding:
+        logger.warning(
+            "Skipping query_embedding on store_query: len=%d != EMBEDDING_DIMENSION=%d",
+            len(query_embedding),
+            dim,
         )
+
+    row = AgentQueryHistory(
+        repo_name=repo_name,
+        query_text=query_text,
+        response_text=response_text,
+        query_embedding=vec,
     )
-    await db.commit()
+    db.add(row)
+    try:
+        await db.commit()
+    except Exception as exc:
+        err = str(exc).lower()
+        if "dimension" in err or "dataerror" in err:
+            await db.rollback()
+            db.add(
+                AgentQueryHistory(
+                    repo_name=repo_name,
+                    query_text=query_text,
+                    response_text=response_text,
+                    query_embedding=None,
+                )
+            )
+            await db.commit()
+            logger.warning(
+                "agent_query_history: DB pgvector size mismatch — stored without embedding. "
+                "Run `deepcode init-db` on a fresh DB or ALTER columns to match EMBEDDING_DIMENSION=%s.",
+                dim,
+            )
+        else:
+            raise
 
 
 async def fetch_memory_context(
@@ -425,13 +459,21 @@ async def fetch_memory_context(
 
     # 3. Fetch past queries (with semantic similarity if vector exists)
     if query_embedding and db.bind.dialect.name == "postgresql":
-        st_qh = (
-            select(AgentQueryHistory)
-            .where(AgentQueryHistory.repo_name == repo_name, AgentQueryHistory.query_embedding.isnot(None))
-            .order_by(AgentQueryHistory.query_embedding.op("<=>")(query_embedding))
-            .limit(10)
-        )
-        for row in (await db.execute(st_qh)).scalars().all():
+        try:
+            st_qh = (
+                select(AgentQueryHistory)
+                .where(
+                    AgentQueryHistory.repo_name == repo_name,
+                    AgentQueryHistory.query_embedding.isnot(None),
+                )
+                .order_by(AgentQueryHistory.query_embedding.op("<=>")(query_embedding))
+                .limit(10)
+            )
+            qh_rows = (await db.execute(st_qh)).scalars().all()
+        except Exception as exc:
+            logger.warning("Semantic query history skipped: %s", exc)
+            qh_rows = []
+        for row in qh_rows:
             try:
                 # cosine matching mapping over vector pg array
                 # pg op('<=>') is distance, so cosine_sim = 1.0 - distance

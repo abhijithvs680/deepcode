@@ -317,7 +317,9 @@ class AgentOrchestrator:
             execution_steps = state.get("execution_steps", [question])
             state["step_history"] = []
             
-            max_total_iterations = 6
+            max_total_iterations = int(
+                getattr(self.settings, "ORCHESTRATOR_MAX_ITERATIONS", 16) or 16
+            )
             total_iterations = 0
             
             # Persist original stream callback
