@@ -57,8 +57,16 @@ class IDEState:
     early_stop_reason: str = ""
     last_rag_reason: str = ""
 
+    # User-closed editor tabs — excluded from working_set / rankings until agent re-opens.
+    closed_paths: set[str] = field(default_factory=set)
+    # idle | running | awaiting_confirm (driven by IDE app during orchestration)
+    ui_phase: str = "idle"
+    last_confirm_reasons: list[str] = field(default_factory=list)
+
+    current_task: dict[str, Any] = field(default_factory=dict)
+
     trace_events: list[dict[str, Any]] = field(default_factory=list)
-    max_trace_lines: int = 120
+    max_trace_lines: int = 160
 
     terminal_log: list[str] = field(default_factory=list)
     max_terminal_lines: int = 500
@@ -71,10 +79,19 @@ class IDEState:
             return True
         return False
 
+    @staticmethod
+    def _norm_path(p: str) -> str:
+        return str(p or "").replace("\\", "/").strip()
+
+    def _filter_closed(self, paths: list[str]) -> list[str]:
+        if not self.closed_paths:
+            return paths
+        return [p for p in paths if self._norm_path(p) not in self.closed_paths]
+
     def _sync_working_into_open(self) -> None:
-        merged = normalize_paths(
-            list(self.working_set) + list(self.open_files), MAX_OPEN_FILES
-        )
+        ws = self._filter_closed(list(self.working_set))
+        of = self._filter_closed(list(self.open_files))
+        merged = normalize_paths(ws + of, MAX_OPEN_FILES)
         self.open_files = merged
 
     def _sync_tabs(self) -> None:
@@ -100,8 +117,12 @@ class IDEState:
             self.active_file = self.tabs[self.active_tab_index]
 
     def _normalize_all_paths(self) -> None:
-        self.working_set = normalize_paths(self.working_set, MAX_WORKING_SET)
-        self.open_files = normalize_paths(self.open_files, MAX_OPEN_FILES)
+        self.working_set = normalize_paths(
+            self._filter_closed(list(self.working_set)), MAX_WORKING_SET
+        )
+        self.open_files = normalize_paths(
+            self._filter_closed(list(self.open_files)), MAX_OPEN_FILES
+        )
         self.touched_files = normalize_paths(self.touched_files, MAX_TOUCHED)
         self._sync_tabs()
 
@@ -117,6 +138,8 @@ class IDEState:
         if not self.tabs:
             return
         af = self.tabs[self.active_tab_index]
+        if af and af != "_session":
+            self.closed_paths.add(self._norm_path(af))
         for lst in (self.open_files, self.working_set):
             while af in lst:
                 lst.remove(af)
@@ -131,6 +154,7 @@ class IDEState:
         if t == "agent_file_open":
             p = str(event.get("path") or "").replace("\\", "/").strip()
             if p:
+                self.closed_paths.discard(p)
                 self.active_file = p
                 if p not in self.open_files:
                     self.open_files.insert(0, p)
@@ -142,6 +166,7 @@ class IDEState:
             fp = str(event.get("file") or "").replace("\\", "/").strip()
             diff = str(event.get("diff") or "")
             if fp:
+                self.closed_paths.discard(fp)
                 self.pending_diff[fp] = diff
                 self.diff_mode = True
                 self.active_file = fp
@@ -202,20 +227,38 @@ class IDEState:
             esr = str(event.get("early_stop_reason") or "").strip()
             if esr:
                 self.early_stop_reason = esr
-        elif t == "step" and event.get("phase") == "result":
+        elif t == "task_start":
+            self.current_task = {
+                "task_id": event.get("task_id"),
+                "description": str(event.get("description") or "")[:240],
+                "cycle": event.get("cycle"),
+            }
+        elif t == "task_complete":
+            self.current_task = {}
+        elif t == "step" and event.get("phase") in ("start", "result"):
+            ph = str(event.get("phase"))
             tool = event.get("tool") or "?"
             action = event.get("action") or "?"
-            st = event.get("status") or "?"
-            summ = (event.get("summary") or "")[:80]
+            sid = event.get("subgoal_id")
+            grp = str(sid) if sid is not None else "main"
             row: dict[str, Any] = {
+                "phase": ph,
+                "step": int(event.get("step", 0)),
+                "group": grp,
                 "tool": str(tool),
                 "action": str(action),
-                "status": str(st),
-                "summary": str(summ).strip(),
             }
-            ms = event.get("duration_ms")
-            if ms is not None:
-                row["duration_ms"] = ms
+            if ph == "result":
+                row["status"] = str(event.get("status") or "?")
+                summ = (event.get("summary") or "")[:80]
+                row["summary"] = str(summ).strip()
+                ms = event.get("duration_ms")
+                if ms is not None:
+                    row["duration_ms"] = ms
+            else:
+                ap = event.get("args_preview")
+                if ap:
+                    row["args_preview"] = str(ap)[:120]
             self.trace_events.append(row)
             if len(self.trace_events) > self.max_trace_lines:
                 self.trace_events = self.trace_events[-self.max_trace_lines :]
@@ -224,15 +267,25 @@ class IDEState:
         """After run completes — context continuity + ranking."""
         if not meta:
             return
-        self.working_set = list(meta.get("active_working_set") or [])
-        self.file_scores = {
-            str(k).replace("\\", "/"): float(v)
-            for k, v in (meta.get("file_scores") or {}).items()
-            if k
-        }
+        ws = [
+            self._norm_path(str(p))
+            for p in (meta.get("active_working_set") or [])
+            if p and self._norm_path(str(p)) not in self.closed_paths
+        ]
+        self.working_set = ws
+        fs_new: dict[str, float] = {}
+        for k, v in (meta.get("file_scores") or {}).items():
+            if not k:
+                continue
+            nk = self._norm_path(str(k))
+            if nk and nk not in self.closed_paths:
+                fs_new[nk] = float(v)
+        self.file_scores = fs_new
         if not self.file_scores:
             for i, p in enumerate(meta.get("react_priority_files") or []):
-                self.file_scores[str(p).replace("\\", "/")] = 1.0 - i * 0.1
+                np = self._norm_path(str(p))
+                if np and np not in self.closed_paths:
+                    self.file_scores[np] = 1.0 - i * 0.1
         self.shared_context = dict(meta.get("shared_context") or {})
         self.global_insights = list(meta.get("global_insights") or [])
         self.cross_subgoal_meta = dict(meta.get("cross_subgoal_meta") or {})
@@ -291,10 +344,24 @@ class IDEState:
         lines: list[str] = []
         ws_set = set(self.working_set)
         ranked = sorted(
-            self.file_scores.keys(),
+            (
+                p
+                for p in self.file_scores.keys()
+                if p not in self.closed_paths
+            ),
             key=lambda p: self.file_scores.get(p, 0),
             reverse=True,
         )[:24]
+
+        ct = self.current_task
+        if ct.get("description"):
+            tid = ct.get("task_id") or "?"
+            lines.append("[bold]> Current task[/bold]")
+            lines.append(
+                f" · [{rich_escape(str(tid))}] "
+                f"{rich_escape(str(ct.get('description', ''))[:200])}"
+            )
+            lines.append("")
 
         pf = self.prior_findings_text()
         if pf:
@@ -339,6 +406,12 @@ class IDEState:
         return "\n".join(lines)
 
     def status_bar_text(self) -> str:
+        if self.ui_phase == "awaiting_confirm":
+            life = "[bold yellow]⚠ Awaiting confirmation[/bold yellow]"
+        elif self.ui_phase == "running":
+            life = "[cyan]● Running…[/cyan]"
+        else:
+            life = "[green]✓ Ready[/green]"
         a = self.agent_status
         c = float(a.get("confidence") or 0) if a else float(self.confidence or 0)
         if c < 0.5:
@@ -353,7 +426,7 @@ class IDEState:
                 if self.early_stop_reason
                 else ""
             )
-            return f"{cc}{es}".strip()
+            return f"{life}  {cc}{es}".strip()
         w = (
             "  [red]⚠ low grounding[/red]"
             if a.get("weak_grounding")
@@ -363,7 +436,7 @@ class IDEState:
         if self.early_stop_reason:
             es = f"  [yellow]stop: {rich_escape(self.early_stop_reason)}[/yellow]"
         return (
-            f"{cc}  files={int(a.get('files_read') or 0)}  "
+            f"{life}  {cc}  files={int(a.get('files_read') or 0)}  "
             f"symbols={int(a.get('symbols') or 0)}{w}{es}"
         ).strip()
 
@@ -385,18 +458,40 @@ class IDEState:
             parts.append(f"early_stop: {self.early_stop_reason}\n")
         if self.last_rag_reason:
             parts.append(f"last_rag: {self.last_rag_reason}\n")
+        if self.last_confirm_reasons:
+            parts.append("\n[bold]Last confirm reasons[/bold]\n")
+            for r in self.last_confirm_reasons[-6:]:
+                parts.append(f" · {rich_escape(str(r)[:120])}\n")
         parts.append("\n[bold]Tool sequence[/bold]\n")
         if not self.trace_events:
             parts.append("[dim](no steps yet)[/dim]")
         else:
-            for ev in self.trace_events[-40:]:
+            cur_g: str | None = None
+            for ev in self.trace_events[-60:]:
+                g = str(ev.get("group") or "main")
+                if g != cur_g:
+                    parts.append(f"\n[bold magenta]━━ {g} ━━[/bold magenta]\n")
+                    cur_g = g
+                ph = str(ev.get("phase") or "result")
                 tool = ev.get("tool", "?")
                 action = ev.get("action", "?")
-                st = ev.get("status", "?")
-                sm = (ev.get("summary") or "")[:72]
-                ms = ev.get("duration_ms")
-                suf = f" ({ms}ms)" if ms is not None else ""
-                parts.append(
-                    f" · [cyan]{tool}[/cyan].{action} → {st}{suf} {sm}\n"
-                )
+                sn = ev.get("step")
+                sn_s = f"{int(sn) + 1}" if isinstance(sn, int) else "?"
+                if ph == "start":
+                    ap = (ev.get("args_preview") or "")[:64]
+                    ap_s = f" {rich_escape(ap)}" if ap else ""
+                    parts.append(
+                        f"  [dim]start[/dim] [{sn_s}] "
+                        f"[cyan]{tool}[/cyan].{action}{ap_s}\n"
+                    )
+                else:
+                    st = ev.get("status", "?")
+                    sm = (ev.get("summary") or "")[:64]
+                    ms = ev.get("duration_ms")
+                    suf = f" ({ms}ms)" if ms is not None else ""
+                    parts.append(
+                        f"  [bold]end[/bold] [{sn_s}] "
+                        f"[cyan]{tool}[/cyan].{action} → {st}{suf} "
+                        f"{rich_escape(sm)}\n"
+                    )
         return "".join(parts)

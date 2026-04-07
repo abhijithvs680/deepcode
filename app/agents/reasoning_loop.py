@@ -535,6 +535,9 @@ async def _emit_step_evt(
         ev["useful"] = useful
     if args_preview and phase == "start":
         ev["args_preview"] = args_preview[:220]
+    sg = state.get("subgoal_id")
+    if sg:
+        ev["subgoal_id"] = sg
     await _emit_react(state, ev)
 
 
@@ -556,6 +559,8 @@ async def run_reasoning_loop(
         max_steps = min(max_steps + 2, hard_cap)
     if cls_loop < 0.3:
         max_steps = min(max_steps + 2, hard_cap)
+    if cls_loop < 0.5:
+        max_steps = min(max_steps, 2)
 
     intent = (state.get("classification") or {}).get("agent_intent", "exploratory")
     if intent == "broad":
@@ -664,6 +669,17 @@ async def run_reasoning_loop(
             logger.info("ReasoningLoop: cancel requested at step %s", i)
             state["react_early_stop_reason"] = "user_cancelled"
             await _emit_react(state, {"type": "react_cancelled", "step": i})
+            break
+
+        if i >= 1 and int(state.get("react_useful_steps") or 0) == 0:
+            logger.info(
+                "ReasoningLoop: early stop no_signal_query (no useful steps after first)"
+            )
+            state["react_early_stop_reason"] = "no_signal_query"
+            await _emit_react(
+                state,
+                {"type": "react_low_signal_stop", "step": i},
+            )
             break
 
         vo = valid_observations(state.get("react_observations") or [])

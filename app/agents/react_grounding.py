@@ -52,6 +52,45 @@ def has_strong_merged_lists(files: list[str], symbols: list[str]) -> bool:
     return len(files) >= 2 or len(symbols) >= 2
 
 
+_CODEISH_HINTS = frozenset(
+    {
+        "file",
+        "files",
+        "code",
+        "error",
+        "fix",
+        "bug",
+        "implement",
+        "refactor",
+        "patch",
+        "edit",
+        "repo",
+        "function",
+        "class",
+        "import",
+        "traceback",
+        "exception",
+        "test",
+        "build",
+    }
+)
+
+
+def is_trivial_query(query: str) -> bool:
+    """
+    Short, non-code queries (e.g. greetings) — skip heavy ReAct / grounding gates.
+    """
+    q = (query or "").lower().strip()
+    if not q:
+        return True
+    words = q.split()
+    if len(words) > 3:
+        return False
+    if any(h in q for h in _CODEISH_HINTS):
+        return False
+    return True
+
+
 def has_strong_rag(ranked_ctx: list[Any] | None) -> bool:
     """Require multiple chunks with non-trivial average score."""
     if not ranked_ctx or len(ranked_ctx) < 2:
@@ -71,10 +110,15 @@ def has_strong_rag(ranked_ctx: list[Any] | None) -> bool:
 
 
 def may_emit_answer(state: dict[str, Any], ranked_ctx: list) -> bool:
-    """Write mode, file/symbol evidence, or strong RAG bundle."""
+    """Write mode, trivial chat, any RAG hits, file/symbol evidence, or strong RAG."""
+    q = (state.get("query") or state.get("current_step") or "").strip()
+    if is_trivial_query(q):
+        return True
     if state.get("write_enabled"):
         return True
     if has_strong_evidence(state):
+        return True
+    if ranked_ctx:
         return True
     if has_strong_rag(ranked_ctx):
         return True

@@ -356,7 +356,100 @@ class AgentOrchestrator:
 
         try:
             status_cb = kwargs.get("status_callback") if "kwargs" in locals() else state.get("status_callback")
-            
+
+            from app.agents.react_grounding import compute_answer_confidence, is_trivial_query
+            from app.core.event_bus import EventBus
+
+            if mode == "ask" and is_trivial_query(question):
+                if status_cb:
+                    await status_cb("Quick reply (trivial query)…")
+                t0 = time.perf_counter()
+                prompt = (
+                    "You are a helpful coding assistant. Reply briefly and naturally "
+                    "(one short paragraph or less for greetings and tiny talk).\n\n"
+                    f"User: {question}\nAssistant:"
+                )
+                stream_cb = kwargs.get("stream_callback")
+                if stream_cb:
+                    chunks: list[str] = []
+                    async for ch in self._provider.stream_generate(prompt):
+                        chunks.append(ch)
+                        await stream_cb(ch)
+                    answer = "".join(chunks)
+                else:
+                    answer = await self._provider.generate(prompt)
+                latency_ms = (time.perf_counter() - t0) * 1000
+                state["answer"] = answer
+                state["latency_ms"] = latency_ms
+                state["full_prompt"] = prompt
+                state["ranked_ctx"] = []
+                state["tool_results"] = []
+                state["context"] = ""
+                state["final_confidence"] = min(
+                    0.95,
+                    float(classification.get("confidence", 1.0) or 1.0),
+                )
+                if self._interaction_logger and session_id:
+                    await self._interaction_logger.log_interaction(
+                        session_id=session_id,
+                        question=question,
+                        context="",
+                        full_prompt=prompt,
+                        answer=answer,
+                        provider=self.settings.LLM_PROVIDER,
+                        model=self.settings.LLM_MODEL,
+                        latency_ms=latency_ms,
+                    )
+                if self._db and repo_id:
+                    from app.memory.intel_store import store_query
+
+                    await store_query(
+                        self._db,
+                        repo_id,
+                        question,
+                        answer[:2500],
+                        state.get("base_query_embed"),
+                    )
+                return_dict = {
+                    "answer": answer,
+                    "session_id": session_id,
+                    "latency_ms": latency_ms,
+                    "model": self.settings.LLM_MODEL,
+                    "provider": self.settings.LLM_PROVIDER,
+                    "meta": {
+                        "selected_tool": None,
+                        "router_confidence": state.get("router_confidence"),
+                        "router_source": "trivial_fast_path",
+                        "retrieved_files": [],
+                        "final_confidence": state["final_confidence"],
+                        "classification": classification,
+                        "agent_intent": classification.get("agent_intent"),
+                        "tool_steps_count": 0,
+                        "rag_used": False,
+                        "rag_reason": "trivial_fast_path",
+                        "files_touched": [],
+                        "symbols_used": [],
+                        "answer_confidence": compute_answer_confidence(state),
+                        "require_user_confirm": False,
+                        "active_working_set": [],
+                        "file_scores": {},
+                        "global_insights": [],
+                        "cross_subgoal_summary": "",
+                        "early_stop_reason": "",
+                        "react_early_stop_reason": "",
+                    },
+                }
+                if trace:
+                    return_dict["trace"] = trace.model_dump()
+                await EventBus.emit(
+                    {
+                        "type": "final_answer",
+                        "content": answer,
+                        "session_id": session_id,
+                    }
+                )
+                return return_dict
+
             # Phase 6: Autonomous Memory mapped natively explicitly into state
             if status_cb: await status_cb("🧠 Analyzing historical vectors natively...")
             from app.memory.intel_store import fetch_memory_context
@@ -428,6 +521,25 @@ class AgentOrchestrator:
                         retriever_ref = AgentRegistry.get("Retriever")
 
                         if self.settings.REACT_AGENT_ENABLED and mode != "plan":
+                            if (
+                                mode == "ask"
+                                and (state.get("classification") or {}).get(
+                                    "agent_intent"
+                                )
+                                == "broad"
+                            ):
+                                logger.info(
+                                    "[Orchestrator] Broad intent ask: skip ReAct, "
+                                    "parallel tool+RAG only"
+                                )
+                                if status_cb:
+                                    await status_cb(
+                                        "Broad query — parallel retrieval (no ReAct)…"
+                                    )
+                                state = await run_parallel_tool_rag(state)
+                                ptr += 1
+                                continue
+
                             from app.agents.reasoning_loop import (
                                 enough_context,
                                 finalize_react_edit_session,

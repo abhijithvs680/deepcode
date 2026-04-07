@@ -17,7 +17,9 @@ from textual.widgets import Footer, Header, Input, RichLog, Static
 
 from app.cli.commands.ask import run_ask_async, run_long_goal_async
 from app.cli.tui.app import ConfirmDiffScreen, IngestionLoaderScreen
+from app.cli.tui.clipboard_util import copy_plain_text, strip_rich_markup
 from app.cli.tui.ide_event_buffer import IdeEventDebouncer
+from app.cli.tui.ide_shell import IdeSubprocessShell, format_shell_line
 from app.cli.tui.ide_state import IDEState
 from app.cli.tui.widgets import chat as chatfmt
 from app.cli.tui.widgets.command_palette import CommandPaletteScreen
@@ -35,10 +37,14 @@ class DeepCodeIdeApp(App):
     BINDINGS = [
         Binding("ctrl+p", "command_palette", "Commands", show=True),
         Binding("ctrl+l", "clear_chat", "Clear chat", show=True),
-        Binding("ctrl+b", "toggle_terminal", "Events", show=True),
+        Binding("ctrl+b", "toggle_terminal", "Events/Shell", show=True),
         Binding("ctrl+t", "toggle_trace", "Trace", show=True),
         Binding("ctrl+i", "next_tab", "Next tab", show=True),
         Binding("ctrl+w", "close_tab", "Close tab", show=True),
+        Binding("ctrl+shift+e", "copy_explorer", "Copy explorer", show=False),
+        Binding("ctrl+shift+d", "copy_editor", "Copy editor", show=False),
+        Binding("ctrl+shift+t", "copy_trace_panel", "Copy trace", show=False),
+        Binding("ctrl+shift+v", "copy_event_log", "Copy events", show=False),
         Binding(
             "ctrl+c",
             "cancel_agent",
@@ -71,8 +77,18 @@ class DeepCodeIdeApp(App):
     #ide-trace.hidden { display: none; height: 0; min-height: 0; border: none; }
     #ide-terminal { height: 10; min-height: 4; border-top: outer $primary 30%; padding: 0 1; }
     #ide-terminal.hidden { display: none; height: 0; min-height: 0; border: none; }
+    #ide-shell-stack {
+        height: 10;
+        min-height: 4;
+        border-top: outer $success 35%;
+        layout: vertical;
+        padding: 0 1;
+    }
+    #ide-shell-stack.hidden { display: none; height: 0; min-height: 0; border: none; }
+    #ide-shell-out { height: 1fr; min-height: 3; }
+    #ide-shell-in { height: 1; margin-top: 1; }
     #ide-editor-tabs { height: 1; padding: 0 1; background: $panel 80%; }
-    Input { border: tall $primary 30%; margin: 0 1 1 1; dock: bottom; }
+    #input { border: tall $primary 30%; margin: 0 1 1 1; dock: bottom; }
     """
 
     def __init__(self, *, raw_repo_input: str | None = None) -> None:
@@ -81,7 +97,9 @@ class DeepCodeIdeApp(App):
         self._repo_id = None
         self._repo_path = None
         self.ide_state = IDEState()
-        self._terminal_visible = True
+        self._bottom_mode = "events"
+        self._ide_shell: IdeSubprocessShell | None = None
+        self._shell_cwd: str | None = None
         self._trace_visible = False
         self._ev_debounce = IdeEventDebouncer(
             interval_s=0.1, on_flush=self._on_debounced_events
@@ -104,6 +122,10 @@ class DeepCodeIdeApp(App):
                 yield VerticalScroll(id="ide-explorer-scroll")
         yield RichLog(id="ide-trace", auto_scroll=True, wrap=True, markup=True)
         yield RichLog(id="ide-terminal", auto_scroll=True, wrap=True, markup=True)
+        with Vertical(id="ide-shell-stack"):
+            yield Static("Shell", classes="ide-panel-title")
+            yield RichLog(id="ide-shell-out", auto_scroll=True, wrap=True, markup=True)
+            yield Input(placeholder="Shell command… Enter", id="ide-shell-in")
         yield Input(
             placeholder="Message…  Ctrl+P  /ask /edit /run /plan /trace /metrics",
             id="input",
@@ -114,22 +136,57 @@ class DeepCodeIdeApp(App):
         self._ev_debounce.bind_app(self)
         self.query_one("#input", Input).focus()
         self.query_one("#ide-trace", RichLog).add_class("hidden")
+        self.query_one("#ide-shell-stack", Vertical).add_class("hidden")
         self.push_screen(IngestionLoaderScreen(self.raw_repo_input))
+
+    def on_unmount(self) -> None:
+        sh = getattr(self, "_ide_shell", None)
+        if sh is not None:
+            import asyncio
+
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(sh.stop())
+            except RuntimeError:
+                pass
 
     def apply_repo_context(self, repo_id: str, repo_path: str) -> None:
         self._repo_id = repo_id
         self._repo_path = repo_path
         if self._repo_path:
             self.sub_title = f"{settings.LLM_MODEL} | {Path(self._repo_path).name}"
+        self._dispose_shell_worker()
         self._mount_chat(chatfmt.ingest_ready_banner())
         self._refresh_all_panels()
 
+    @work(exclusive=True, group="shell_reset")
+    async def _dispose_shell_worker(self) -> None:
+        if self._ide_shell is not None:
+            await self._ide_shell.stop()
+        self._ide_shell = None
+        self._shell_cwd = None
+
     def action_toggle_terminal(self) -> None:
-        self._terminal_visible = not self._terminal_visible
+        self._flush_ide_events()
         term = self.query_one("#ide-terminal", RichLog)
-        term.set_class(not self._terminal_visible, "hidden")
+        shell = self.query_one("#ide-shell-stack", Vertical)
+        if self._bottom_mode == "events":
+            self._bottom_mode = "shell"
+            term.add_class("hidden")
+            shell.remove_class("hidden")
+        else:
+            self._bottom_mode = "events"
+            shell.add_class("hidden")
+            term.remove_class("hidden")
+
+    def _flush_ide_events(self) -> None:
+        try:
+            self._ev_debounce.flush_now()
+        except Exception:
+            pass
 
     def action_toggle_trace(self) -> None:
+        self._flush_ide_events()
         self._trace_visible = not self._trace_visible
         tr = self.query_one("#ide-trace", RichLog)
         tr.set_class(not self._trace_visible, "hidden")
@@ -137,12 +194,58 @@ class DeepCodeIdeApp(App):
             self._refresh_trace_log()
 
     def action_next_tab(self) -> None:
+        self._flush_ide_events()
         self.ide_state.next_tab()
         self._refresh_all_panels()
 
     def action_close_tab(self) -> None:
+        self._flush_ide_events()
         self.ide_state.close_active_tab()
         self._refresh_all_panels()
+
+    def action_copy_explorer(self) -> None:
+        block = (
+            self.ide_state.timeline_text()
+            + "\n\n"
+            + self.ide_state.explorer_text()
+        )
+        if copy_plain_text(strip_rich_markup(block)):
+            self._mount_chat(chatfmt.system_block("Explorer + timeline copied (plain text)."))
+        else:
+            self._mount_chat(chatfmt.error_block("Clipboard unavailable on this system."))
+
+    def action_copy_editor(self) -> None:
+        diff = self._resolve_diff_raw_for_active()
+        if diff:
+            ok = copy_plain_text(diff[:500_000])
+        else:
+            p = self._active_file_path()
+            ok = False
+            if p is not None and p.is_file():
+                try:
+                    ok = copy_plain_text(
+                        p.read_text(encoding="utf-8", errors="replace")[:500_000]
+                    )
+                except OSError:
+                    ok = False
+        if ok:
+            self._mount_chat(chatfmt.system_block("Editor content copied (plain text)."))
+        else:
+            self._mount_chat(chatfmt.error_block("Nothing to copy or clipboard failed."))
+
+    def action_copy_trace_panel(self) -> None:
+        txt = strip_rich_markup(self.ide_state.trace_panel_text())
+        if copy_plain_text(txt):
+            self._mount_chat(chatfmt.system_block("Trace panel copied (plain text)."))
+        else:
+            self._mount_chat(chatfmt.error_block("Clipboard unavailable."))
+
+    def action_copy_event_log(self) -> None:
+        body = "\n".join(self.ide_state.terminal_log)
+        if copy_plain_text(body):
+            self._mount_chat(chatfmt.system_block("Event log copied (plain text)."))
+        else:
+            self._mount_chat(chatfmt.error_block("Clipboard unavailable."))
 
     def _on_debounced_events(self, batch: list[dict]) -> None:
         for ev in batch:
@@ -190,9 +293,9 @@ class DeepCodeIdeApp(App):
                 )
                 path_w = self.query_one("#ide-editor-path", Static)
                 af = self.ide_state.active_file or "(no file)"
-                if self.ide_state.diff_mode and af and af != "(no file)":
-                    diff = self.ide_state.pending_diff.get(af) or ""
-                    plus, minus = self._diff_plus_minus(diff)
+                diff_raw = self._resolve_diff_raw_for_active()
+                if self.ide_state.diff_mode and diff_raw and af != "(no file)":
+                    plus, minus = self._diff_plus_minus(diff_raw)
                     path_w.update(
                         f"[DIFF +{plus} -{minus}] {escape(af)}"
                     )
@@ -219,6 +322,50 @@ class DeepCodeIdeApp(App):
 
         self.call_next(_w)
 
+    def _resolve_diff_raw_for_active(self) -> str:
+        s = self.ide_state
+        af = (s.active_file or "").strip()
+        pd = s.pending_diff
+        if not pd:
+            return ""
+        if af and af != "_session":
+            d = pd.get(af)
+            if d:
+                return str(d)
+        sess = pd.get("_session")
+        if sess:
+            return str(sess)
+        if af:
+            return str(pd.get(af) or "")
+        return ""
+
+    def _active_file_path(self) -> Path | None:
+        root = self._repo_path
+        af = (self.ide_state.active_file or "").strip()
+        if not root or not af or af == "_session":
+            return None
+        rel = af.replace("\\", "/").lstrip("/")
+        try:
+            root_p = Path(root).expanduser().resolve()
+            cand = (root_p / rel).resolve()
+            if root_p not in cand.parents and cand != root_p:
+                return None
+            return cand if cand.is_file() else None
+        except (OSError, ValueError):
+            return None
+
+    @staticmethod
+    def _diff_line_markup(line: str) -> str:
+        if line.startswith("+") and not line.startswith("+++"):
+            return f"[green]{escape(line)}[/green]"
+        if line.startswith("-") and not line.startswith("---"):
+            return f"[red]{escape(line)}[/red]"
+        if line.startswith("@@"):
+            return f"[cyan]{escape(line)}[/cyan]"
+        if line.startswith("--- ") or line.startswith("+++ "):
+            return f"[yellow]{escape(line)}[/yellow]"
+        return f"[dim]{escape(line)}[/dim]"
+
     @staticmethod
     def _diff_plus_minus(diff: str) -> tuple[int, int]:
         if not diff:
@@ -237,16 +384,17 @@ class DeepCodeIdeApp(App):
         af = self.ide_state.active_file
         if not af:
             return "[dim]Open a file via agent read_file or explorer.[/dim]"
-        diff = self.ide_state.pending_diff.get(af)
-        if diff:
-            lines = diff[:14000].splitlines()
-            return "\n".join(escape(L) for L in lines[:500])
-        root = self._repo_path or ""
-        if not root:
-            return escape(af)
-        fp = Path(root) / af
-        if not fp.is_file():
-            return f"[dim]{escape(af)} — not on disk or outside root[/dim]"
+        if self.ide_state.diff_mode:
+            diff = self._resolve_diff_raw_for_active()
+            if diff:
+                lines = diff[:14000].splitlines()
+                return "\n".join(self._diff_line_markup(L) for L in lines[:500])
+        fp = self._active_file_path()
+        if fp is None:
+            root = self._repo_path or ""
+            if not root:
+                return escape(af)
+            return f"[dim]{escape(af)} — not on disk or outside repo root[/dim]"
         try:
             text = fp.read_text(encoding="utf-8", errors="replace")
         except OSError as e:
@@ -314,7 +462,35 @@ class DeepCodeIdeApp(App):
 
         self.call_next(_w)
 
+    @work(exclusive=False, group="ide_shell")
+    async def _run_shell_command(self, line: str) -> None:
+        def append_out(msg: str) -> None:
+            try:
+                self.query_one("#ide-shell-out", RichLog).write(format_shell_line(msg))
+            except Exception:
+                pass
+
+        cwd = self._repo_path or str(Path.cwd().resolve())
+        if self._ide_shell is None or self._shell_cwd != cwd:
+            if self._ide_shell is not None:
+                await self._ide_shell.stop()
+            self._ide_shell = IdeSubprocessShell(
+                cwd=cwd,
+                on_line=lambda t: self.call_next(lambda: append_out(t)),
+            )
+            self._shell_cwd = cwd
+            self.call_next(lambda: append_out(f"[cwd {cwd}]"))
+
+        self.call_next(lambda: append_out(f"> {line}"))
+        await self._ide_shell.send_line(line)
+
     def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "ide-shell-in":
+            raw = event.value.strip()
+            event.input.value = ""
+            if raw:
+                self._run_shell_command(raw)
+            return
         if getattr(self, "_orchestrator_busy", False):
             return
         if event.input.id != "input":
@@ -383,8 +559,9 @@ class DeepCodeIdeApp(App):
             self._mount_chat(
                 chatfmt.system_block(
                     "IDE: /help /metrics /trace /clear /browse /repo /run /edit /plan …\n"
-                    "Ctrl+P palette  |  Ctrl+B events  |  Ctrl+T structured trace  |  "
-                    "Ctrl+I next tab  |  Ctrl+W close tab  |  Ctrl+L clear chat"
+                    "Ctrl+P palette  |  Ctrl+B events log / shell  |  Ctrl+T trace  |  "
+                    "Ctrl+I tab  |  Ctrl+W close tab  |  Ctrl+L clear chat  |  "
+                    "Ctrl+Shift+E/D/T/V copy explorer / editor / trace / event log"
                 )
             )
             return
@@ -452,6 +629,7 @@ class DeepCodeIdeApp(App):
 
     @work(exclusive=False, group="file_explorer")
     async def _push_file_explorer(self) -> None:
+        self._flush_ide_events()
         from app.cli.tui.file_explorer import FileExplorerScreen
 
         root = self._repo_path or str(Path.cwd().resolve())
@@ -504,11 +682,18 @@ class DeepCodeIdeApp(App):
                 self.ide_state.pending_diff["_session"] = combined_diff
                 self.ide_state.diff_mode = True
                 self.call_next(self._refresh_all_panels)
-            return await self.push_screen_wait(
-                ConfirmDiffScreen(
-                    diff_text=combined_diff, confirm_reasons=confirm_reasons
+            self.ide_state.last_confirm_reasons = list(confirm_reasons or [])
+            self.ide_state.ui_phase = "awaiting_confirm"
+            self.call_next(self._refresh_all_panels)
+            try:
+                return await self.push_screen_wait(
+                    ConfirmDiffScreen(
+                        diff_text=combined_diff, confirm_reasons=confirm_reasons
+                    )
                 )
-            )
+            finally:
+                self.ide_state.ui_phase = "running"
+                self.call_next(self._refresh_all_panels)
 
         async def _status_callback(msg: str) -> None:
             self._log_terminal(str(msg))
@@ -541,6 +726,7 @@ class DeepCodeIdeApp(App):
 
         self._react_cancel_event = asyncio.Event()
         self._orchestrator_busy = True
+        self.ide_state.ui_phase = "running"
         self.ide_state.terminal_log.clear()
 
         def _clear_term() -> None:
@@ -595,6 +781,7 @@ class DeepCodeIdeApp(App):
                 pass
             EventBus.unsubscribe(_on_ide_event)
             self._orchestrator_busy = False
+            self.ide_state.ui_phase = "idle"
 
             def _unlock() -> None:
                 try:

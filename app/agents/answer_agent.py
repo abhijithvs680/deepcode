@@ -14,7 +14,7 @@ from app.tools.base_tool import ToolResult
 from app.memory.intel_store import fetch_symbol_anchor_text, fetch_git_context_text
 from app.memory.symbol_extract import extract_query_identifiers
 from app.core.config import get_settings
-from app.agents.react_grounding import may_emit_answer
+from app.agents.react_grounding import is_trivial_query, may_emit_answer
 
 logger = logging.getLogger(__name__)
 
@@ -253,15 +253,22 @@ class AnswerAgent(BaseAgent):
                 len(react_observations),
             )
 
-        grounding = (
-            "GROUNDING (mandatory): Base your answer ONLY on ReAct exploration, "
-            "Tool Execution Results, Code intelligence / retrieved snippets, and "
-            "Cognitive Memory when present. Do not invent repository paths, symbols, "
-            "or behavior not supported by that evidence.\n"
-            "If the supplied context is insufficient to answer reliably, reply with "
-            "exactly this sentence and nothing else as the answer body: "
-            "Not enough information in the provided context."
-        )
+        if is_trivial_query(question):
+            grounding = (
+                "This is a short general or conversational message. Reply briefly and "
+                "naturally. You do not need repository evidence for greetings or simple "
+                "chit-chat."
+            )
+        else:
+            grounding = (
+                "GROUNDING (mandatory): Base your answer ONLY on ReAct exploration, "
+                "Tool Execution Results, Code intelligence / retrieved snippets, and "
+                "Cognitive Memory when present. Do not invent repository paths, symbols, "
+                "or behavior not supported by that evidence.\n"
+                "If the supplied context is insufficient to answer reliably, reply with "
+                "exactly this sentence and nothing else as the answer body: "
+                "Not enough information in the provided context."
+            )
         if state.get("write_enabled"):
             grounding += (
                 "\nException for edit mode: you may propose <patch> blocks only for "
