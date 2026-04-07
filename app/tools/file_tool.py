@@ -44,6 +44,10 @@ class FileTool(Tool):
                 return await self.list_dir(**kwargs)
             elif action == "find_symbol":
                 return await self.find_symbol(**kwargs)
+            elif action == "get_file_dependencies":
+                return await self.get_file_dependencies(**kwargs)
+            elif action == "get_symbol_dependencies":
+                return await self.get_symbol_dependencies(**kwargs)
             else:
                 return ToolResult(tool=self.name, action=action, success=False, error=f"Unknown Tool Action: '{action}'")
         except Exception as e:
@@ -278,3 +282,75 @@ class FileTool(Tool):
             )
         except Exception as e:
             return ToolResult(tool=self.name, action="find_symbol", success=False, error=str(e))
+
+    async def get_file_dependencies(
+        self,
+        path: str,
+        limit: int = 30,
+    ) -> ToolResult:
+        """Import graph: what this file imports and what imports it (indexed repo only)."""
+        if not self._db or not self._repo_name:
+            return ToolResult(
+                tool=self.name,
+                action="get_file_dependencies",
+                success=False,
+                error="Dependency graph requires DB session + indexed repo_id.",
+            )
+        try:
+            from app.memory.intel_store import get_dependency_bundle_for_file
+
+            bundle = await get_dependency_bundle_for_file(
+                self._db,
+                self._repo_name,
+                path,
+                limit_each=min(max(4, int(limit or 30)), 50),
+            )
+            return ToolResult(
+                tool=self.name,
+                action="get_file_dependencies",
+                success=True,
+                data={"file": path.replace("\\", "/"), **bundle},
+            )
+        except Exception as e:
+            return ToolResult(
+                tool=self.name,
+                action="get_file_dependencies",
+                success=False,
+                error=str(e),
+            )
+
+    async def get_symbol_dependencies(
+        self,
+        name: str,
+        limit: int = 20,
+    ) -> ToolResult:
+        """Resolve symbol → file(s), then import neighborhood (indexed repo only)."""
+        if not self._db or not self._repo_name:
+            return ToolResult(
+                tool=self.name,
+                action="get_symbol_dependencies",
+                success=False,
+                error="Dependency graph requires DB session + indexed repo_id.",
+            )
+        try:
+            from app.memory.intel_store import get_dependency_bundle_for_symbol
+
+            bundle = await get_dependency_bundle_for_symbol(
+                self._db,
+                self._repo_name,
+                name,
+                limit_each=min(max(4, int(limit or 20)), 40),
+            )
+            return ToolResult(
+                tool=self.name,
+                action="get_symbol_dependencies",
+                success=True,
+                data=bundle,
+            )
+        except Exception as e:
+            return ToolResult(
+                tool=self.name,
+                action="get_symbol_dependencies",
+                success=False,
+                error=str(e),
+            )

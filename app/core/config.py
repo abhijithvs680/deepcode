@@ -90,6 +90,40 @@ class Settings(BaseSettings):
     # ReAct-style tool-first exploration (RAG only when context is insufficient)
     REACT_AGENT_ENABLED: bool = True
     REACT_MAX_STEPS: int = 5
+    # When exploration confidence is low, ReAct may use up to this many steps
+    REACT_MAX_STEPS_CAP: int = 7
+    # One ReAct loop per heuristic subgoal, then merge context (single subgoal = prior behavior)
+    HIERARCHICAL_REACT_ENABLED: bool = True
+    # After 2+ subgoals, re-run cross-subgoal synthesis to bias remaining subgoal order
+    HIERARCHICAL_SYNTH_FEEDBACK: bool = True
+    # Minimum dependency-graph edges seen (imports+imported_by) before early-stop when plan needs deps
+    HIERARCHICAL_MIN_DEP_EDGES_FOR_EARLY_STOP: int = 4
+    # Expose transactional file_edit in ReAct when write_enabled / edit mode (not dry_run)
+    REACT_EDIT_TOOL_ENABLED: bool = True
+    # Batch edits per subgoal; commit/rollback once after run_reasoning_loop
+    REACT_SUBGOAL_EDIT_TRANSACTION: bool = True
+    # If True, ReAct file_edit never persists (working copy only; finalize rolls back)
+    REACT_EDIT_DRY_RUN: bool = False
+    # Cap active_working_set / carry into subgoals (reduces context drift)
+    ACTIVE_WORKING_SET_MAX: int = 8
+    # Inject resolve_conflicts subgoal when mid-hierarchy synthesis reports conflicts
+    HIERARCHICAL_CONFLICT_RESOLUTION_SUBGOAL: bool = True
+
+    # Multi-file edit mode (CLI/TUI `edit`): max files auto-touched per run
+    EDIT_MAX_AUTO_FILES: int = 5
+    # LLM repair attempts after a failed transactional <edit> (each hunk)
+    EDIT_MAX_REPAIR_ATTEMPTS: int = 2
+
+    # Multi-cycle macro goals (TUI /run, long_run_agent)
+    LONG_RUN_ENABLED: bool = True
+    LONG_RUN_MAX_CYCLES: int = 20
+    # Wall-clock and step budgets for macro runs (0 = no limit)
+    LONG_RUN_MAX_RUNTIME_SECONDS: int = 0
+    LONG_RUN_MAX_TOTAL_TOOL_STEPS: int = 0
+    # After each task, run project tests if True (can be slow)
+    LONG_RUN_POST_TASK_VERIFY: bool = False
+    # Set non-empty to persist task_graph.json / artifacts.json / execution_log.jsonl per /run
+    LONG_RUN_PERSIST_DIR: str = ""
 
 
 @lru_cache()

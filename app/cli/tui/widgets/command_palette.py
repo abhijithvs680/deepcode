@@ -9,10 +9,12 @@ from textual.widgets import Label, OptionList
 
 # (value inserted into input or executed prefix, description)
 PALETTE_ENTRIES: list[tuple[str, str]] = [
-    ("/build ", "Modify code, apply patches, and run tests"),
+    ("/run ", "Long-run: macro goal → multiple edit-mode cycles"),
+    ("/edit ", "Edit mode: explore → plan → patches (replaces /build)"),
     ("/plan ", "Create an implementation plan without writing"),
     ("/ask ", "Ask a standard question (Default)"),
-    ("/open ", "Open/View a specific file"),
+    ("/browse", "Mini IDE: browse files under the workspace"),
+    ("/open ", "Open/View a specific file (with query)"),
     ("/find ", "Search for a symbol or text"),
     ("/explain ", "Explain a function or component"),
     ("/trace", "Load latest trace JSON into side panel"),

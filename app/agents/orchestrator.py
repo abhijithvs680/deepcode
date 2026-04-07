@@ -65,6 +65,10 @@ class AgentOrchestrator:
 
         trace = DebugTrace(query=question) if debug else None
 
+        if mode == "build":
+            logger.warning("Mode 'build' is deprecated; use 'edit'.")
+            mode = "edit"
+
         # Week 12 Phase 2: Start Query Classifier concurrently early.
         from app.agents.query_classifier import QueryClassifier
         classifier = QueryClassifier(self._provider)
@@ -148,12 +152,14 @@ class AgentOrchestrator:
         from app.agents.answer_agent import AnswerAgent
         from app.agents.critic_agent import CriticAgent
         from app.agents.execution_planner import ExecutionPlanner
+        from app.agents.edit_planner_agent import EditPlannerAgent
 
         # Register instances
         AgentRegistry.register(ExecutionPlanner(self._provider))
         AgentRegistry.register(PlannerAgent(self._db, self._provider))
         AgentRegistry.register(ToolExecutionAgent())
         AgentRegistry.register(RetrieverAgent(self._db, self._provider))
+        AgentRegistry.register(EditPlannerAgent(self._provider, db=self._db))
         AgentRegistry.register(AnswerAgent(self._db, self._provider, self._interaction_logger))
         AgentRegistry.register(CriticAgent(self._db, self._provider))
 
@@ -298,6 +304,15 @@ class AgentOrchestrator:
 
         # Core DAG: planner → parallel tool+RAG → answer → critic → file_write_test
         workflow = ["Planner", "ParallelRetrieval", "Answer", "Critic", "FileWriteTest"]
+        if mode == "edit":
+            workflow = [
+                "Planner",
+                "ParallelRetrieval",
+                "EditPlanner",
+                "Answer",
+                "Critic",
+                "FileWriteTest",
+            ]
         ws_root = _workspace_root_for_repo(repo_id)
         self._repo_path = ws_root
         state = {
@@ -315,7 +330,9 @@ class AgentOrchestrator:
             "classification": classification,
             "disable_aggressive_overrides": disable_aggressive_overrides,
             "mode": mode,
-            "write_enabled": mode == "build",
+            "write_enabled": mode == "edit",
+            "edit_plan": {},
+            "edit_context": {},
             "auto_apply": auto_apply,
             "dry_run": dry_run,
             "rag_used": False,
@@ -326,6 +343,14 @@ class AgentOrchestrator:
             "symbols_found": [],
             "react_force_rag": False,
             "react_priority_files": [],
+            "react_cancel_event": kwargs.get("react_cancel_event"),
+            "global_insights": [],
+            "shared_context": {"top_files": [], "top_symbols": []},
+            "learned_file_bias": [],
+            "cross_subgoal_summary": "",
+            "cross_subgoal_meta": {},
+            "next_subgoal_bias": [],
+            "active_working_set": [],
         }
 
         try:
@@ -337,6 +362,17 @@ class AgentOrchestrator:
             if self._db and repo_id:
                 mems = await fetch_memory_context(self._db, repo_id, question, state.get("base_query_embed"))
                 state["memories"] = [{'summary': f"({m['type'].upper()}) [{m['symbol']}] {m['context']}"} for m in mems[:5]]
+                if mode == "edit":
+                    try:
+                        from app.memory.intel_store import fetch_edit_learning_file_bias
+
+                        lb = await fetch_edit_learning_file_bias(
+                            self._db, repo_id, question
+                        )
+                        if lb:
+                            state["learned_file_bias"] = lb
+                    except Exception as exc:
+                        logger.debug("fetch_edit_learning_file_bias: %s", exc)
 
             # Phase 2: Execution Planner boundaries
             if status_cb: await status_cb("💬 Structuring execution task sequence natively...")
@@ -358,9 +394,9 @@ class AgentOrchestrator:
                 state["current_step_index"] = step_idx
                 logger.info(f"--- [Step {step_idx+1}/{len(execution_steps)}] {step} ---")
                 
-                # Streaming Phase 1: Stream ONLY on final answer natively
-                # V1 Constraints: Stream explicitly disabled under 'build' mode ensuring Textual UX Stability!
-                if step_idx == len(execution_steps) - 1 and mode != "build":
+                # Streaming Phase 1: stream only on the final answer step.
+                # Edit mode disables streaming so the TUI can show ReAct + structured output first.
+                if step_idx == len(execution_steps) - 1 and mode != "edit":
                     if original_stream_cb:
                         state["stream_callback"] = original_stream_cb
                 else:
@@ -383,6 +419,7 @@ class AgentOrchestrator:
                     if status_cb:
                         if node_name == "Planner": await status_cb(f"🧠 Planning task sequence [Step {step_idx+1}/{len(execution_steps)}]...")
                         elif node_name == "ParallelRetrieval": await status_cb("⚙️ Retrieving context natively...")
+                        elif node_name == "EditPlanner": await status_cb("📝 Planning edits from exploration…")
                         elif node_name == "Answer": await status_cb("🧠 Reasoning and generating...")
                         elif node_name == "FileWriteTest": await status_cb("🛠 Applying patches & evaluating Autonomous Sandboxes...")
                     
@@ -392,25 +429,300 @@ class AgentOrchestrator:
                         if self.settings.REACT_AGENT_ENABLED and mode != "plan":
                             from app.agents.reasoning_loop import (
                                 enough_context,
+                                finalize_react_edit_session,
                                 run_reasoning_loop,
                             )
+                            from app.agents.hierarchical_planner import (
+                                Subgoal,
+                                build_active_working_set,
+                                create_substate,
+                                decompose_goal,
+                                estimate_dynamic_score,
+                                extract_key_findings,
+                                merge_react_subgoal_results,
+                                merged_files_so_far,
+                                merged_symbols_so_far,
+                                partial_subgoal_traces_for_synthesis,
+                                should_stop_subgoal_loop,
+                                subgoal_success,
+                                subgoal_synthesis_bias_score,
+                            )
+                            from app.agents.react_grounding import (
+                                compute_answer_confidence,
+                                has_strong_merged_context,
+                                has_strong_merged_lists,
+                            )
+                            from app.core.event_bus import EventBus
                             from app.tools.registry import ToolRegistry
 
+                            prior_tools = list(state.get("tool_results") or [])
+                            q_for_plan = state.get("current_step") or state.get(
+                                "query", ""
+                            )
+                            plan = decompose_goal(q_for_plan)
+                            state["hierarchical_plan"] = {
+                                "goal": plan.goal,
+                                "subgoals": [
+                                    {
+                                        "id": sg.id,
+                                        "description": sg.description,
+                                        "priority": sg.priority,
+                                    }
+                                    for sg in plan.subgoals
+                                ],
+                            }
+
                             if status_cb:
+                                nsg = len(plan.subgoals)
                                 await status_cb(
-                                    "Exploring codebase (tool-first ReAct)…"
+                                    f"Exploring codebase ({nsg} subgoal{'s' if nsg != 1 else ''}, tool-first)…"
                                 )
                             reg = ToolRegistry(
                                 state.get("workspace_root") or os.getcwd(),
                                 db=self._db,
                                 repo_name=repo_id,
                             )
-                            state = await run_reasoning_loop(
-                                state,
-                                self._provider,
-                                reg,
-                                max_steps=self.settings.REACT_MAX_STEPS,
+
+                            subgoal_runs: list = []
+                            hierarchical = bool(
+                                getattr(
+                                    self.settings,
+                                    "HIERARCHICAL_REACT_ENABLED",
+                                    True,
+                                )
                             )
+
+                            if not hierarchical:
+                                try:
+                                    state = await run_reasoning_loop(
+                                        state,
+                                        self._provider,
+                                        reg,
+                                        max_steps=self.settings.REACT_MAX_STEPS,
+                                    )
+                                finally:
+                                    await finalize_react_edit_session(
+                                        reg,
+                                        state,
+                                        commit=subgoal_success(state),
+                                    )
+                            else:
+                                state.setdefault("global_insights", [])
+                                state.setdefault(
+                                    "shared_context",
+                                    {"top_files": [], "top_symbols": []},
+                                )
+                                remaining = list(plan.subgoals)
+                                completed_ids: list[str] = []
+                                while remaining:
+                                    if state.get("react_cancel_event") is not None:
+                                        ev = state["react_cancel_event"]
+                                        if getattr(ev, "is_set", lambda: False)():
+                                            logger.info(
+                                                "Hierarchical ReAct: cancel before next subgoal"
+                                            )
+                                            break
+                                    bias_hints = state.get("next_subgoal_bias") or []
+                                    remaining.sort(
+                                        key=lambda sg: (
+                                            -estimate_dynamic_score(
+                                                sg, subgoal_runs
+                                            )
+                                            - subgoal_synthesis_bias_score(
+                                                sg, bias_hints
+                                            ),
+                                            -sg.priority,
+                                        )
+                                    )
+                                    sg = remaining.pop(0)
+                                    await EventBus.emit(
+                                        {
+                                            "type": "subgoal_start",
+                                            "subgoal_id": sg.id,
+                                            "description": sg.description[:200],
+                                            "priority": sg.priority,
+                                        }
+                                    )
+                                    sub = create_substate(state, sg)
+                                    try:
+                                        sub = await run_reasoning_loop(
+                                            sub,
+                                            self._provider,
+                                            reg,
+                                            max_steps=self.settings.REACT_MAX_STEPS,
+                                        )
+                                    finally:
+                                        await finalize_react_edit_session(
+                                            reg,
+                                            sub,
+                                            commit=subgoal_success(sub),
+                                        )
+                                    subgoal_runs.append((sg, sub))
+                                    state["active_working_set"] = (
+                                        build_active_working_set(subgoal_runs)
+                                    )
+                                    state["global_insights"].append(
+                                        extract_key_findings(sub)
+                                    )
+                                    if (
+                                        len(subgoal_runs) >= 2
+                                        and remaining
+                                        and getattr(
+                                            self.settings,
+                                            "HIERARCHICAL_SYNTH_FEEDBACK",
+                                            True,
+                                        )
+                                    ):
+                                        from app.agents.cross_subgoal_synthesis import (
+                                            synthesize_cross_subgoals,
+                                        )
+
+                                        fb_state = {
+                                            **state,
+                                            "subgoal_traces": partial_subgoal_traces_for_synthesis(
+                                                subgoal_runs
+                                            ),
+                                            "query": q_for_plan,
+                                        }
+                                        try:
+                                            cs_fb = await synthesize_cross_subgoals(
+                                                fb_state, self._provider
+                                            )
+                                            if cs_fb:
+                                                gaps_fb = list(
+                                                    cs_fb.get("gaps") or []
+                                                )
+                                                conf_fb = list(
+                                                    cs_fb.get("conflicts") or []
+                                                )
+                                                if gaps_fb or conf_fb:
+                                                    state["next_subgoal_bias"] = (
+                                                        gaps_fb + conf_fb
+                                                    )[:14]
+                                                if (
+                                                    conf_fb
+                                                    and remaining
+                                                    and getattr(
+                                                        self.settings,
+                                                        "HIERARCHICAL_CONFLICT_RESOLUTION_SUBGOAL",
+                                                        True,
+                                                    )
+                                                    and not state.get(
+                                                        "_conflict_resolution_subgoal_added"
+                                                    )
+                                                ):
+                                                    desc = (
+                                                        "Reconcile conflicting "
+                                                        "traces between subgoals: "
+                                                        + "; ".join(
+                                                            str(x)[:140]
+                                                            for x in conf_fb[:5]
+                                                        )
+                                                    )[:400]
+                                                    remaining.insert(
+                                                        0,
+                                                        Subgoal(
+                                                            "resolve_conflicts",
+                                                            desc,
+                                                            99,
+                                                        ),
+                                                    )
+                                                    state[
+                                                        "_conflict_resolution_subgoal_added"
+                                                    ] = True
+                                        except Exception as exc:
+                                            logger.debug(
+                                                "mid-hierarchy synthesis: %s",
+                                                exc,
+                                            )
+                                    state["shared_context"] = {
+                                        "top_files": merged_files_so_far(
+                                            subgoal_runs
+                                        )[:3],
+                                        "top_symbols": merged_symbols_so_far(
+                                            subgoal_runs
+                                        )[:5],
+                                    }
+                                    sconf = compute_answer_confidence(sub)
+                                    if subgoal_success(sub):
+                                        completed_ids.append(sg.id)
+                                    await EventBus.emit(
+                                        {
+                                            "type": "subgoal_complete",
+                                            "subgoal_id": sg.id,
+                                            "confidence": sconf,
+                                            "files_found": len(
+                                                sub.get("files_read") or []
+                                            ),
+                                            "symbols_found": len(
+                                                sub.get("symbols_found") or []
+                                            ),
+                                            "useful_steps": int(
+                                                sub.get("react_useful_steps") or 0
+                                            ),
+                                        }
+                                    )
+                                    if should_stop_subgoal_loop(
+                                        plan_size=len(plan.subgoals),
+                                        completed_ids=completed_ids,
+                                        subgoal_runs=subgoal_runs,
+                                        strong_merged_predicate=has_strong_merged_lists,
+                                        plan_subgoals=plan.subgoals,
+                                    ):
+                                        logger.info(
+                                            "Hierarchical ReAct: early stop after subgoal %s",
+                                            sg.id,
+                                        )
+                                        break
+
+                                state, _traces = merge_react_subgoal_results(
+                                    state,
+                                    prior_tool_results=prior_tools,
+                                    subgoal_runs=subgoal_runs,
+                                )
+                                if hierarchical and len(_traces) >= 2:
+                                    from app.agents.cross_subgoal_synthesis import (
+                                        synthesize_cross_subgoals,
+                                    )
+
+                                    cs = await synthesize_cross_subgoals(
+                                        state, self._provider
+                                    )
+                                    if cs:
+                                        state["cross_subgoal_summary"] = (
+                                            str(cs.get("summary_text") or "").strip()
+                                        )
+                                        state["cross_subgoal_meta"] = {
+                                            "gaps": list(cs.get("gaps") or []),
+                                            "conflicts": list(
+                                                cs.get("conflicts") or []
+                                            ),
+                                            "agreements": list(
+                                                cs.get("agreements") or []
+                                            ),
+                                        }
+                                        gaps_n = len(state["cross_subgoal_meta"]["gaps"])
+                                        conf_n = len(
+                                            state["cross_subgoal_meta"]["conflicts"]
+                                        )
+                                        if (gaps_n or conf_n) and int(
+                                            state.get("react_useful_steps") or 0
+                                        ) <= 0:
+                                            state["react_force_rag"] = True
+                                        fac = 1.0
+                                        if conf_n:
+                                            fac *= max(
+                                                0.55,
+                                                1.0 - 0.08 * min(conf_n, 4),
+                                            )
+                                        if gaps_n:
+                                            fac *= max(
+                                                0.65,
+                                                1.0 - 0.04 * min(gaps_n, 6),
+                                            )
+                                        state["goal_progress"] = float(
+                                            state.get("goal_progress") or 0
+                                        ) * float(fac)
 
                             rc = float(state.get("router_confidence") or 0.0)
                             tool_conf_high = rc > 0.90
@@ -418,6 +730,60 @@ class AgentOrchestrator:
                             force_no_rag = state.get("force_tool") or (
                                 tool_conf_high and q_type in rag_bypass_types
                             )
+                            from app.agents.hierarchical_planner import (
+                                avg_exploration_confidence,
+                            )
+
+                            hier_runs = (
+                                subgoal_runs
+                                if hierarchical and len(subgoal_runs) > 0
+                                else None
+                            )
+                            if hier_runs is not None:
+                                merged_react_conf = avg_exploration_confidence(
+                                    hier_runs
+                                )
+                            else:
+                                merged_react_conf = compute_answer_confidence(state)
+                            cls_conf = float(
+                                (state.get("classification") or {}).get(
+                                    "confidence", 1.0
+                                )
+                                or 1.0
+                            )
+                            low_signal = merged_react_conf < 0.5 or cls_conf < 0.5
+                            forced_rag = bool(state.get("react_force_rag"))
+                            strong_ctx = has_strong_merged_context(state)
+                            enough = enough_context(state)
+
+                            async def _run_rag(reason: str) -> None:
+                                nonlocal state
+                                state["rag_used"] = True
+                                state["rag_reason"] = reason
+                                state["rag_focus_files"] = list(
+                                    state.get("react_priority_files") or []
+                                )
+                                try:
+                                    state = await asyncio.wait_for(
+                                        retriever_ref.run(dict(state)),
+                                        timeout=self.settings.RAG_RETRIEVAL_TIMEOUT_S,
+                                    )
+                                except asyncio.TimeoutError:
+                                    logger.warning(
+                                        "Retriever exceeded timeout after ReAct (%s).",
+                                        reason,
+                                    )
+                                    state["ranked_ctx"] = []
+                                    fl = list(state.get("fallbacks_local") or [])
+                                    fl.append("rag_timeout")
+                                    state["fallbacks_local"] = fl
+                                except Exception as ex:
+                                    logger.warning(
+                                        "Retriever failed after ReAct (%s): %s",
+                                        reason,
+                                        ex,
+                                    )
+                                    state["ranked_ctx"] = []
 
                             if force_no_rag:
                                 state["ranked_ctx"] = []
@@ -429,55 +795,20 @@ class AgentOrchestrator:
                                 if "rag_skipped_git_bypass" not in fl:
                                     fl.append("rag_skipped_git_bypass")
                                 state["fallbacks_local"] = fl
-                            elif state.get("react_force_rag"):
-                                state["rag_used"] = True
-                                state["rag_reason"] = "no_progress_after_react_tools"
-                                try:
-                                    state = await asyncio.wait_for(
-                                        retriever_ref.run(dict(state)),
-                                        timeout=self.settings.RAG_RETRIEVAL_TIMEOUT_S,
-                                    )
-                                except asyncio.TimeoutError:
-                                    logger.warning(
-                                        "Retriever exceeded timeout after ReAct (force_rag)."
-                                    )
-                                    state["ranked_ctx"] = []
-                                    fl = list(state.get("fallbacks_local") or [])
-                                    fl.append("rag_timeout")
-                                    state["fallbacks_local"] = fl
-                                except Exception as ex:
-                                    logger.warning(
-                                        "Retriever failed after ReAct (force_rag): %s",
-                                        ex,
-                                    )
-                                    state["ranked_ctx"] = []
-                            elif enough_context(state):
+                            elif strong_ctx:
+                                state.setdefault("ranked_ctx", [])
+                                state["rag_used"] = False
+                                state["rag_reason"] = "strong_merged_context_skip_rag"
+                            elif enough:
                                 state.setdefault("ranked_ctx", [])
                                 state["rag_used"] = False
                                 state["rag_reason"] = "enough_context_after_react"
+                            elif forced_rag and not strong_ctx:
+                                await _run_rag("no_progress_after_react_tools")
+                            elif low_signal:
+                                await _run_rag("low_confidence_boost_rag")
                             else:
-                                state["rag_used"] = True
-                                state["rag_reason"] = (
-                                    "insufficient_grounding_after_react"
-                                )
-                                try:
-                                    state = await asyncio.wait_for(
-                                        retriever_ref.run(dict(state)),
-                                        timeout=self.settings.RAG_RETRIEVAL_TIMEOUT_S,
-                                    )
-                                except asyncio.TimeoutError:
-                                    logger.warning(
-                                        "Retriever exceeded timeout after ReAct."
-                                    )
-                                    state["ranked_ctx"] = []
-                                    fl = list(state.get("fallbacks_local") or [])
-                                    fl.append("rag_timeout")
-                                    state["fallbacks_local"] = fl
-                                except Exception as ex:
-                                    logger.warning(
-                                        "Retriever failed after ReAct: %s", ex
-                                    )
-                                    state["ranked_ctx"] = []
+                                await _run_rag("insufficient_grounding_after_react")
 
                             if trace:
                                 trace.react_tool_steps_count = len(
@@ -531,14 +862,318 @@ class AgentOrchestrator:
 
                     # Not a registered agent — inline sandbox (must run before AgentRegistry.get)
                     if node_name == "FileWriteTest":
-                        if mode == "build" and state.get("write_enabled"):
+                        if mode == "edit" and state.get("write_enabled"):
                             import re
+
+                            from app.agents.edit_patch_parse import parse_edit_blocks
+                            from app.agents.react_grounding import (
+                                compute_answer_confidence,
+                            )
+                            from app.tools.file_edit_tool import FileEditTool
                             from app.tools.file_write_tool import FileWriteTool
                             from app.tools.test_runner_tool import TestRunnerTool
 
-                            fw_tool = FileWriteTool(repo_path=self._repo_path or ".")
-                            allowed_files = list({c["file_path"] for c in state.get("ranked_ctx", [])})
+                            rp = self._repo_path or "."
+                            fw_tool = FileWriteTool(repo_path=rp)
+                            allowed_set: set[str] = set()
+                            for c in state.get("ranked_ctx") or []:
+                                fp = (c.get("file_path") or "").replace("\\", "/")
+                                if fp:
+                                    allowed_set.add(fp)
+                            for f in state.get("files_read") or []:
+                                allowed_set.add(str(f).replace("\\", "/"))
+                            for item in (state.get("edit_plan") or {}).get("plan") or []:
+                                if isinstance(item, dict) and item.get("file"):
+                                    allowed_set.add(
+                                        str(item["file"]).replace("\\", "/")
+                                    )
+                            allowed_files = list(allowed_set)
                             answer = state.get("answer", "")
+
+                            max_edit = int(
+                                getattr(
+                                    self.settings, "EDIT_MAX_AUTO_FILES", 5
+                                )
+                                or 5
+                            )
+                            max_edit = max(1, max_edit)
+
+                            cls_c = float(
+                                (state.get("classification") or {}).get(
+                                    "confidence", 1.0
+                                )
+                                or 1.0
+                            )
+                            post_answer_conf = compute_answer_confidence(state)
+                            force_confirm = (
+                                post_answer_conf < 0.6 or cls_c < 0.6
+                            )
+                            state["require_edit_confirmation"] = force_confirm
+
+                            confirm_cb = (
+                                kwargs.get("confirm_diff_callback")
+                                if "kwargs" in locals()
+                                else state.get("confirm_diff_callback")
+                            )
+
+                            def _file_allowed(rel: str) -> bool:
+                                fn = rel.replace("\\", "/")
+                                if fn in allowed_set:
+                                    return True
+                                return any(
+                                    fn.startswith(a + "/") for a in allowed_set
+                                )
+
+                            def _diff_header(paths: list[str]) -> str:
+                                if not paths:
+                                    return ""
+                                lines = "\n".join(
+                                    f" - {p}" for p in paths[:max_edit]
+                                )
+                                return f"Proposed changes:\n{lines}\n\n"
+
+                            edit_ops = parse_edit_blocks(answer)[:max_edit]
+
+                            if edit_ops:
+                                fe = FileEditTool(rp)
+                                ok_final = False
+                                for _attempt in range(2):
+                                    fe.begin_session()
+                                    branch_ok = True
+                                    for ed in edit_ops:
+                                        fp = str(ed["file_path"]).replace(
+                                            "\\", "/"
+                                        )
+                                        if not _file_allowed(fp):
+                                            logger.warning(
+                                                "[FileWriteTest] Skipping edit "
+                                                "(path not allowed): %s",
+                                                fp,
+                                            )
+                                            continue
+                                        search_t = ed["search"]
+                                        replace_t = ed["replace"]
+                                        r = fe.apply_search_replace(
+                                            fp,
+                                            search_t,
+                                            replace_t,
+                                            expected_occurrences=1,
+                                        )
+                                        if not r.success:
+                                            from app.agents.edit_repair import (
+                                                repair_search_replace,
+                                            )
+
+                                            max_repairs = int(
+                                                getattr(
+                                                    self.settings,
+                                                    "EDIT_MAX_REPAIR_ATTEMPTS",
+                                                    2,
+                                                )
+                                                or 2
+                                            )
+                                            max_repairs = max(1, min(max_repairs, 5))
+                                            for _repair in range(max_repairs):
+                                                fixed = await repair_search_replace(
+                                                    self._provider,
+                                                    repo_path=rp,
+                                                    rel_path=fp,
+                                                    original_search=search_t,
+                                                    original_replace=replace_t,
+                                                    error=str(r.error or ""),
+                                                    user_query=state.get(
+                                                        "query", question
+                                                    ),
+                                                )
+                                                if not fixed:
+                                                    break
+                                                r = fe.apply_search_replace(
+                                                    fp,
+                                                    fixed["search"],
+                                                    fixed["replace"],
+                                                    expected_occurrences=1,
+                                                )
+                                                if r.success:
+                                                    break
+                                        if not r.success:
+                                            logger.warning(
+                                                "[FileWriteTest] transactional "
+                                                "edit failed: %s",
+                                                r.error,
+                                            )
+                                            branch_ok = False
+                                            break
+                                    if branch_ok and fe.touched_files():
+                                        ok_final = True
+                                        break
+                                    fe.rollback_session()
+
+                                if ok_final and fe.touched_files():
+                                    touched = fe.touched_files()
+                                    combined_diff = (
+                                        _diff_header(touched)
+                                        + fe.unified_diff_preview()
+                                    )
+                                    conf = True
+                                    if (
+                                        confirm_cb
+                                        and (not auto_apply or force_confirm)
+                                        and not dry_run
+                                    ):
+                                        conf = await confirm_cb(combined_diff)
+
+                                    if dry_run:
+                                        fe.rollback_session()
+                                        logger.info(
+                                            "[FileWriteTest] Dry-run (transactional edits)."
+                                        )
+                                        ptr += 1
+                                        continue
+
+                                    if not state.get("files_read"):
+                                        logger.warning(
+                                            "[FileWriteTest] Refusing apply: "
+                                            "no files_read."
+                                        )
+                                        fe.rollback_session()
+                                        ptr += 1
+                                        continue
+
+                                    if conf:
+                                        cres = fe.commit_session(allowed_set)
+                                        if cres.success:
+                                            if self._db and repo_id:
+                                                try:
+                                                    from app.memory.intel_store import (
+                                                        record_edit_learning,
+                                                    )
+
+                                                    await record_edit_learning(
+                                                        self._db,
+                                                        repo_id,
+                                                        query=state.get(
+                                                            "query", question
+                                                        ),
+                                                        files=touched,
+                                                        success=True,
+                                                        detail="transactional_edit",
+                                                    )
+                                                except Exception as le:
+                                                    logger.debug(
+                                                        "record_edit_learning: %s",
+                                                        le,
+                                                    )
+                                            tr_res = TestRunnerTool(
+                                                rp
+                                            ).execute_tests()
+                                            if not tr_res.success:
+                                                logger.warning(
+                                                    "[FileWriteTest] Tests failed: %s",
+                                                    tr_res.error[:200],
+                                                )
+                                                if (
+                                                    state["critic_retry_count"]
+                                                    < state["max_retries"]
+                                                ):
+                                                    sig = hash(
+                                                        tr_res.error[-500:]
+                                                    )
+                                                    state[
+                                                        "failure_signatures"
+                                                    ].append(sig)
+                                                    if (
+                                                        state[
+                                                            "failure_signatures"
+                                                        ].count(sig)
+                                                        >= 3
+                                                    ):
+                                                        logger.error(
+                                                            "Trajectory Halted: repeated test failure."
+                                                        )
+                                                        state[
+                                                            "abort_reason"
+                                                        ] = "repeated_failure"
+                                                        state[
+                                                            "failure_signature"
+                                                        ] = tr_res.error[-500:]
+                                                        ptr += 1
+                                                        continue
+                                                    state["critic_retry"] = True
+                                                    state[
+                                                        "critic_feedback"
+                                                    ] = (
+                                                        f"Tests failed after edit:\n{tr_res.error[-1500:]}\nPlease fix."
+                                                    )
+                                                    state[
+                                                        "critic_retry_count"
+                                                    ] += 1
+                                                    ptr = 0
+                                                    continue
+                                                else:
+                                                    state[
+                                                        "test_failure_final"
+                                                    ] = tr_res.error
+                                                    state[
+                                                        "abort_reason"
+                                                    ] = "max_retries_exceeded"
+                                                    state[
+                                                        "failure_signature"
+                                                    ] = tr_res.error[-500:]
+                                        else:
+                                            fe.rollback_session()
+                                            if self._db and repo_id:
+                                                try:
+                                                    from app.memory.intel_store import (
+                                                        record_edit_learning,
+                                                    )
+
+                                                    await record_edit_learning(
+                                                        self._db,
+                                                        repo_id,
+                                                        query=state.get(
+                                                            "query", question
+                                                        ),
+                                                        files=touched,
+                                                        success=False,
+                                                        detail=str(
+                                                            cres.error
+                                                        )[:400],
+                                                    )
+                                                except Exception:
+                                                    pass
+                                            logger.error(
+                                                "[FileWriteTest] commit failed: %s",
+                                                cres.error,
+                                            )
+                                    else:
+                                        fe.rollback_session()
+                                        logger.info(
+                                            "[FileWriteTest] Transactional edits "
+                                            "discarded by user."
+                                        )
+                                    ptr += 1
+                                    continue
+                                if edit_ops and self._db and repo_id:
+                                    try:
+                                        from app.memory.intel_store import (
+                                            record_edit_learning,
+                                        )
+
+                                        await record_edit_learning(
+                                            self._db,
+                                            repo_id,
+                                            query=state.get("query", question),
+                                            files=[
+                                                str(
+                                                    e.get("file_path", "")
+                                                ).replace("\\", "/")
+                                                for e in edit_ops
+                                            ],
+                                            success=False,
+                                            detail="transactional_edit_failed",
+                                        )
+                                    except Exception:
+                                        pass
 
                             patch_matches = re.finditer(
                                 r"<patch file=['\"]?(.*?)['\"]?>(.*?)</patch>",
@@ -552,71 +1187,151 @@ class AgentOrchestrator:
                                 nc = match.group(2).strip()
                                 df = fw_tool.generate_diff(fp, nc)
                                 if df:
-                                    patches.append({"file_path": fp, "new_content": nc})
+                                    patches.append(
+                                        {"file_path": fp, "new_content": nc}
+                                    )
                                     diffs.append(df)
 
+                            patches = patches[:max_edit]
+
                             if patches:
-                                combined_diff = "\\n\\n".join(diffs)
-                                conf = True
-                                confirm_cb = (
-                                    kwargs.get("confirm_diff_callback")
-                                    if "kwargs" in locals()
-                                    else state.get("confirm_diff_callback")
+                                paths = [p["file_path"] for p in patches]
+                                combined_diff = _diff_header(paths) + "\n\n".join(
+                                    diffs
                                 )
-                                if confirm_cb and not auto_apply and not dry_run:
+                                conf = True
+                                if (
+                                    confirm_cb
+                                    and (not auto_apply or force_confirm)
+                                    and not dry_run
+                                ):
                                     conf = await confirm_cb(combined_diff)
 
                                 if dry_run:
                                     logger.info(
-                                        "[FileWriteTest] Dry-Run mapped flawlessly avoiding executions!"
+                                        "[FileWriteTest] Dry-run (full-file patches)."
+                                    )
+                                    ptr += 1
+                                    continue
+
+                                if not (state.get("files_read") or dry_run):
+                                    logger.warning(
+                                        "[FileWriteTest] Refusing apply: no files_read "
+                                        "(exploration required before edit)."
                                     )
                                     ptr += 1
                                     continue
 
                                 if conf:
-                                    res = fw_tool.apply_patches(patches, allowed_files)
+                                    res = fw_tool.apply_patches(
+                                        patches, allowed_files
+                                    )
                                     if res.success:
-                                        state["patch_branch"] = res.data.get("branch")
+                                        if self._db and repo_id:
+                                            try:
+                                                from app.memory.intel_store import (
+                                                    record_edit_learning,
+                                                )
+
+                                                await record_edit_learning(
+                                                    self._db,
+                                                    repo_id,
+                                                    query=state.get(
+                                                        "query", question
+                                                    ),
+                                                    files=[
+                                                        p["file_path"]
+                                                        for p in patches
+                                                    ],
+                                                    success=True,
+                                                    detail="patch_applied",
+                                                )
+                                            except Exception as le:
+                                                logger.debug(
+                                                    "record_edit_learning: %s", le
+                                                )
+                                        state["patch_branch"] = res.data.get(
+                                            "branch"
+                                        )
                                         tr_res = TestRunnerTool(
-                                            self._repo_path or "."
+                                            rp
                                         ).execute_tests()
                                         if not tr_res.success:
                                             logger.warning(
-                                                "[FileWriteTest] Tests Failed! Routing Critic Retries natively: %s",
+                                                "[FileWriteTest] Tests failed: %s",
                                                 tr_res.error[:200],
                                             )
-                                            if state["critic_retry_count"] < state["max_retries"]:
+                                            if (
+                                                state["critic_retry_count"]
+                                                < state["max_retries"]
+                                            ):
                                                 sig = hash(tr_res.error[-500:])
-                                                state["failure_signatures"].append(sig)
-                                                if state["failure_signatures"].count(sig) >= 3:
-                                                    logger.error(
-                                                        "Trajectory Halted: Same autonomous failure boundary hit 3 times dynamically natively. Extracted limit."
+                                                state["failure_signatures"].append(
+                                                    sig
+                                                )
+                                                if (
+                                                    state["failure_signatures"].count(
+                                                        sig
                                                     )
-                                                    state["abort_reason"] = "repeated_failure"
-                                                    state["failure_signature"] = tr_res.error[
-                                                        -500:
-                                                    ]
-                                                    break
-
+                                                    >= 3
+                                                ):
+                                                    logger.error(
+                                                        "Trajectory Halted: repeated test failure."
+                                                    )
+                                                    state["abort_reason"] = (
+                                                        "repeated_failure"
+                                                    )
+                                                    state["failure_signature"] = (
+                                                        tr_res.error[-500:]
+                                                    )
+                                                    ptr += 1
+                                                    continue
                                                 state["critic_retry"] = True
                                                 state["critic_feedback"] = (
-                                                    f"Tests failed mapping patches explicitly: \\n{tr_res.error[-1500:]}\\nPlease fix."
+                                                    f"Tests failed after patch:\n{tr_res.error[-1500:]}\nPlease fix."
                                                 )
                                                 state["critic_retry_count"] += 1
                                                 ptr = 0
                                                 continue
                                             else:
-                                                state["test_failure_final"] = tr_res.error
-                                                state["abort_reason"] = "max_retries_exceeded"
-                                                state["failure_signature"] = tr_res.error[-500:]
+                                                state["test_failure_final"] = (
+                                                    tr_res.error
+                                                )
+                                                state["abort_reason"] = (
+                                                    "max_retries_exceeded"
+                                                )
+                                                state["failure_signature"] = (
+                                                    tr_res.error[-500:]
+                                                )
                                     else:
+                                        if self._db and repo_id:
+                                            try:
+                                                from app.memory.intel_store import (
+                                                    record_edit_learning,
+                                                )
+
+                                                await record_edit_learning(
+                                                    self._db,
+                                                    repo_id,
+                                                    query=state.get(
+                                                        "query", question
+                                                    ),
+                                                    files=[
+                                                        p["file_path"]
+                                                        for p in patches
+                                                    ],
+                                                    success=False,
+                                                    detail=str(res.error)[:400],
+                                                )
+                                            except Exception:
+                                                pass
                                         logger.error(
-                                            "[FileWriteTest] Patch execution boundary hit limits natively: %s",
+                                            "[FileWriteTest] Patch failed: %s",
                                             res.error,
                                         )
                                 else:
                                     logger.info(
-                                        "[FileWriteTest] Patch Discarded structurally bounds User constraints!"
+                                        "[FileWriteTest] Patch discarded by user."
                                     )
                         ptr += 1
                         continue
@@ -628,9 +1343,9 @@ class AgentOrchestrator:
                         from app.agents.critic_executor import apply_critic_action
                         should_retry = apply_critic_action(state)
 
-                        if mode == "build" and state.get("classification", {}).get("confidence", 1.0) < 0.7:
+                        if mode == "edit" and state.get("classification", {}).get("confidence", 1.0) < 0.7:
                             logger.warning(
-                                "Aborting Build execution writes due to low Confidence evaluations mapped natively!"
+                                "Aborting edit execution writes due to low confidence."
                             )
                             state["write_enabled"] = False
 
@@ -694,6 +1409,8 @@ class AgentOrchestrator:
                     elif q_type == "architecture":
                         await store_decision(self._db, repo_id, sym, ans_slice)
 
+            from app.agents.react_grounding import compute_answer_confidence
+
             return_dict = {
                 "answer": state.get("answer", ""),
                 "session_id": session_id,
@@ -726,6 +1443,24 @@ class AgentOrchestrator:
                     "react_useful_steps": int(state.get("react_useful_steps") or 0),
                     "react_failed_steps": int(state.get("react_failed_steps") or 0),
                     "react_priority_files": list(state.get("react_priority_files") or []),
+                    "answer_confidence": compute_answer_confidence(state),
+                    "require_edit_confirmation": bool(
+                        state.get("require_edit_confirmation")
+                    ),
+                    "learned_file_bias": list(state.get("learned_file_bias") or []),
+                    "goal_progress": float(state.get("goal_progress") or 0),
+                    "subgoal_confidence": state.get("subgoal_confidence") or {},
+                    "hierarchical_react": bool(
+                        getattr(
+                            self.settings, "HIERARCHICAL_REACT_ENABLED", True
+                        )
+                    ),
+                    "hierarchical_plan": state.get("hierarchical_plan"),
+                    "hierarchical_subgoal_count": len(
+                        (state.get("hierarchical_plan") or {}).get("subgoals")
+                        or []
+                    ),
+                    "cross_subgoal_meta": state.get("cross_subgoal_meta") or {},
                 },
             }
             if trace:

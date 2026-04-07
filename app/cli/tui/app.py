@@ -41,7 +41,7 @@ class ConfirmDiffScreen(ModalScreen[bool]):
         else:
             self.dismiss(False)
 
-from app.cli.commands.ask import run_ask_async
+from app.cli.commands.ask import run_ask_async, run_long_goal_async
 from app.cli.tui.widgets import chat as chatfmt
 from app.cli.tui.widgets.command_palette import CommandPaletteScreen
 from app.core.config import get_settings
@@ -159,6 +159,13 @@ class DeepCodeTuiApp(App):
     BINDINGS = [
         Binding("ctrl+p", "command_palette", "Commands", show=True),
         Binding("ctrl+l", "clear_chat", "Clear chat", show=True),
+        Binding(
+            "ctrl+c",
+            "cancel_agent",
+            "Cancel run",
+            show=True,
+            priority=True,
+        ),
     ]
 
     CSS = """
@@ -297,6 +304,16 @@ class DeepCodeTuiApp(App):
     def _append_trace(self, markup: str) -> None:
         self._trace_scroll().mount(Static(markup, classes="chat-line"))
 
+    @work(exclusive=False, group="file_explorer")
+    async def _push_file_explorer(self) -> None:
+        from app.cli.tui.file_explorer import FileExplorerScreen
+
+        screen = FileExplorerScreen(
+            str(Path.cwd().resolve()),
+            repo_id=self._repo_id,
+        )
+        await self.push_screen_wait(screen)
+
     @work
     async def action_command_palette(self) -> None:
         result = await self.push_screen_wait(CommandPaletteScreen())
@@ -319,6 +336,17 @@ class DeepCodeTuiApp(App):
 
     def action_clear_chat(self) -> None:
         self._clear_chat_only()
+
+    def action_cancel_agent(self) -> None:
+        if getattr(self, "_orchestrator_busy", False):
+            ev = getattr(self, "_react_cancel_event", None)
+            if ev is not None and hasattr(ev, "set"):
+                ev.set()
+                self._mount_chat(
+                    chatfmt.system_block("Cancelling current run…")
+                )
+        else:
+            self.exit()
 
     def _clear_chat_only(self) -> None:
         self._chat_scroll().remove_children()
@@ -347,8 +375,30 @@ class DeepCodeTuiApp(App):
             parts = raw.split(maxsplit=1)
             cmd = parts[0].lower()
             arg = parts[1].strip() if len(parts) > 1 else ""
-            if cmd in ("/plan", "/build", "/ask"):
+            if cmd in ("/plan", "/edit", "/ask", "/build", "/run"):
+                if cmd == "/run":
+                    if "--auto-apply" in arg:
+                        auto_apply = True
+                        arg = arg.replace("--auto-apply", "").strip()
+                    if "--dry-run" in arg:
+                        dry_run = True
+                        arg = arg.replace("--dry-run", "").strip()
+                    if not arg:
+                        self._mount_chat(
+                            chatfmt.error_block('Usage: /run "your macro goal"')
+                        )
+                        return
+                    self.run_orchestrator(
+                        arg,
+                        mode="edit",
+                        auto_apply=auto_apply,
+                        dry_run=dry_run,
+                        long_run=True,
+                    )
+                    return
                 mode = cmd[1:]
+                if mode == "build":
+                    mode = "edit"
                 if "--auto-apply" in arg:
                     auto_apply = True
                     arg = arg.replace("--auto-apply", "").strip()
@@ -374,7 +424,7 @@ class DeepCodeTuiApp(App):
         if cmd in ("/help", "/?"):
             self._mount_chat(
                 chatfmt.system_block(
-                    "Slash: /help /metrics /trace /clear /repo <name>\n"
+                    "Slash: /help /metrics /trace /clear /repo <name> /browse /run /edit …\n"
                     "Ctrl+P — command palette  |  Ctrl+L — clear chat"
                 )
             )
@@ -413,8 +463,15 @@ class DeepCodeTuiApp(App):
             )
             return
 
+        if cmd == "/browse":
+            self._push_file_explorer()
+            return
+
         if cmd in ("/repos", "/open", "/find", "/explain"):
             # If standard inputs hit here with text attached, bounce back to orchestrator directly!
+            if cmd == "/open" and not arg:
+                self._push_file_explorer()
+                return
             if cmd != "/repos" and arg:
                 # Remove slash so orchestrator just treats it as raw query alongside hint text!
                 self.run_orchestrator(f"{cmd[1:]} {arg}", mode="ask")
@@ -453,6 +510,7 @@ class DeepCodeTuiApp(App):
         mode: str = "ask",
         auto_apply: bool = False,
         dry_run: bool = False,
+        long_run: bool = False,
     ) -> None:
         self._mount_chat(chatfmt.user_block(question))
 
@@ -510,21 +568,59 @@ class DeepCodeTuiApp(App):
             t = event.get("type")
             touched = False
             if t == "react_session_start":
+                sg = event.get("subgoal_id")
+                if sg:
+                    react_lines.append(
+                        f"── Subgoal [{escape(str(sg))}] "
+                        f"{escape(str(event.get('subgoal_description', ''))[:80])}"
+                    )
                 react_lines.append(
                     f"── ReAct ({event.get('intent', '?')}) "
                     f"max_steps={event.get('max_steps')} ──"
                 )
                 touched = True
-            elif t == "react_step_start":
+            elif t == "subgoal_start":
                 react_lines.append(
-                    f"[Step {int(event.get('step', 0)) + 1}] "
-                    f"{event.get('tool')}.{event.get('action')}"
+                    f"[Subgoal {escape(str(event.get('subgoal_id', '?')))}] "
+                    f"{escape(str(event.get('description', ''))[:100])}"
                 )
                 touched = True
-            elif t == "react_step_result":
-                ok = event.get("success")
-                sym = "→" if ok else "✗"
-                react_lines.append(f"  {sym} {escape(str(event.get('summary', '')))}")
+            elif t == "subgoal_complete":
+                sid = escape(str(event.get("subgoal_id", "?")))
+                cf = event.get("confidence")
+                nf = event.get("files_found", 0)
+                cf_s = f"{float(cf):.2f}" if cf is not None else "?"
+                react_lines.append(
+                    f"  ✓ [{sid}] done  conf={cf_s}  files={nf}"
+                )
+                touched = True
+            elif t == "state":
+                react_lines.append(
+                    f"  · progress={float(event.get('goal_progress', 0)):.2f} "
+                    f"files={event.get('files_read_count', 0)} "
+                    f"useful={event.get('useful_steps', 0)}"
+                )
+                touched = True
+            elif t == "step":
+                ph = event.get("phase")
+                sn = int(event.get("step", 0)) + 1
+                tool = event.get("tool") or "?"
+                action = event.get("action") or "?"
+                if ph == "start":
+                    ap = event.get("args_preview") or ""
+                    extra = f" {escape(ap)}" if ap else ""
+                    react_lines.append(f"[{sn}] {tool}.{action}{extra}")
+                elif ph == "result":
+                    st = event.get("status") or "?"
+                    sym = "→" if st == "success" else "✗"
+                    ms = event.get("duration_ms")
+                    suf = f" ({ms}ms)" if ms is not None else ""
+                    react_lines.append(
+                        f"    {sym} {escape(str(event.get('summary', '')))}{suf}"
+                    )
+                touched = True
+            elif t == "react_cancelled":
+                react_lines.append("  (cancelled by user)")
                 touched = True
             elif t == "react_enough_context":
                 react_lines.append("  (grounding sufficient — ending exploration)")
@@ -542,6 +638,32 @@ class DeepCodeTuiApp(App):
             elif t == "react_llm_error":
                 react_lines.append(f"  (LLM step error: {escape(str(event.get('error', '')))})")
                 touched = True
+            elif t == "cycle_start":
+                react_lines.append(
+                    f"◇ Cycle {event.get('cycle', '?')}: "
+                    f"{escape(str(event.get('goal', ''))[:100])}"
+                )
+                touched = True
+            elif t == "task_start":
+                react_lines.append(
+                    f"  → Task {event.get('task_id', '?')}: "
+                    f"{escape(str(event.get('description', ''))[:120])}"
+                )
+                touched = True
+            elif t == "task_complete":
+                done = event.get("done")
+                sym = "✓" if done else "○"
+                cf = event.get("confidence")
+                cf_s = f"{float(cf):.2f}" if cf is not None else "?"
+                react_lines.append(
+                    f"  {sym} task {event.get('task_id', '?')}  conf={cf_s}"
+                )
+                touched = True
+            elif t == "goal_complete":
+                react_lines.append(
+                    f"◆ Goal complete ({escape(str(event.get('reason', '')))})"
+                )
+                touched = True
 
             if not touched:
                 return
@@ -554,6 +676,9 @@ class DeepCodeTuiApp(App):
 
             self.call_next(_push_react)
 
+        import asyncio
+
+        self._react_cancel_event = asyncio.Event()
         self._orchestrator_busy = True
         try:
             inp_widget = self.query_one("#input", Input)
@@ -563,18 +688,33 @@ class DeepCodeTuiApp(App):
 
         EventBus.subscribe(_on_react_event)
         try:
-            result = await run_ask_async(
-                question,
-                debug=True,
-                context=None,
-                repo_id=self._repo_id,
-                mode=mode,
-                auto_apply=auto_apply,
-                dry_run=dry_run,
-                stream_callback=_stream_callback,
-                confirm_diff_callback=_confirm_diff_callback,
-                status_callback=_status_callback,
-            )
+            if long_run:
+                result = await run_long_goal_async(
+                    question,
+                    debug=True,
+                    context=None,
+                    repo_id=self._repo_id,
+                    auto_apply=auto_apply,
+                    dry_run=dry_run,
+                    stream_callback=_stream_callback,
+                    confirm_diff_callback=_confirm_diff_callback,
+                    status_callback=_status_callback,
+                    react_cancel_event=self._react_cancel_event,
+                )
+            else:
+                result = await run_ask_async(
+                    question,
+                    debug=True,
+                    context=None,
+                    repo_id=self._repo_id,
+                    mode=mode,
+                    auto_apply=auto_apply,
+                    dry_run=dry_run,
+                    stream_callback=_stream_callback,
+                    confirm_diff_callback=_confirm_diff_callback,
+                    status_callback=_status_callback,
+                    react_cancel_event=self._react_cancel_event,
+                )
         except Exception as exc:
             answer_widget.update(chatfmt.error_block(str(exc)))
             self._chat_scroll().scroll_end(animate=False)
@@ -597,7 +737,25 @@ class DeepCodeTuiApp(App):
         _apply_answer_markup(chatfmt.assistant_label() + "\n" + escape(answer))
 
         meta = result.get("meta")
-        if meta is not None:
+        if meta is not None and meta.get("long_run"):
+            lr = meta.get("goal_plan") or []
+            st = meta.get("goal_status") or "?"
+            cyc = meta.get("cycles") or 0
+            lconf = meta.get("last_task_confidence")
+            lcs = f"{float(lconf):.2f}" if lconf is not None else "—"
+            lines = [
+                f"🧭 [bold]Long-run[/bold] status={escape(str(st))}  cycles={cyc}  last_conf={lcs}\n",
+            ]
+            for t in lr[:12]:
+                if not isinstance(t, dict):
+                    continue
+                tid = t.get("id", "?")
+                desc = escape(str(t.get("description", ""))[:56])
+                stt = t.get("status") or "pending"
+                sym = "✓" if stt == "done" else ("⏭" if stt == "skipped" else "→")
+                lines.append(f"  {sym} [{tid}] {desc}\n")
+            self._set_trace_text("".join(lines))
+        elif meta is not None:
             classification = meta.get("classification") or {}
             q_type = classification.get("query_type", "factual")
             q_conf = classification.get("confidence", 1.0)
@@ -618,9 +776,42 @@ class DeepCodeTuiApp(App):
             adap_retries = adap_cfg.get('max_retries', 'N/A')
             git_bias_str = "enabled" if adap_cfg.get("enable_git_bias") else "disabled"
 
+            ans_conf = meta.get("answer_confidence")
+            goal_p = meta.get("goal_progress")
+            conf_line = ""
+            if ans_conf is not None:
+                conf_line = f"📊 [bold]Answer confidence:[/bold] {float(ans_conf):.3f}\n"
+            if goal_p is not None:
+                conf_line += f"🎚 [bold]Goal progress:[/bold] {float(goal_p):.2f}\n"
+
+            hplan = meta.get("hierarchical_plan") or {}
+            hsg = meta.get("hierarchical_subgoal_count")
+            hier_line = ""
+            if hsg is not None and int(hsg) > 0:
+                hier_line = (
+                    f"🪜 [bold]Hierarchical ReAct:[/bold] "
+                    f"{int(hsg)} subgoal(s) "
+                    f"({'on' if meta.get('hierarchical_react') else 'off'})\n"
+                )
+                if hplan.get("subgoals"):
+                    ids = ", ".join(
+                        escape(str(x.get("id", "?")))
+                        for x in hplan["subgoals"][:5]
+                    )
+                    hier_line += f"  [dim]{ids}[/dim]\n"
+                sgc = meta.get("subgoal_confidence") or {}
+                if isinstance(sgc, dict) and sgc:
+                    parts = [
+                        f"{escape(str(k))}:{float(v):.2f}"
+                        for k, v in list(sgc.items())[:6]
+                    ]
+                    hier_line += f"  [dim]conf: {' '.join(parts)}[/dim]\n"
+
             markup = (
                 f"🧠 [bold]Query Type:[/bold] {q_type} ({q_conf:.2f})\n"
                 f"🎯 [bold]Agent intent:[/bold] {escape(str(agent_intent))}\n"
+                f"{hier_line}"
+                f"{conf_line}"
                 f"⚙️ [bold]Strategy:[/bold]\n"
                 f"  - rag_top_k: {adap_before} -> {adap_k}\n"
                 f"  - git_bias: {git_bias_str}\n"

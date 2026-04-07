@@ -112,6 +112,23 @@ class RetrieverAgent(BaseAgent):
 
         logger.info(f"[{self.name}] Initiating vector retrieval matrix...")
 
+        raw_focus = state.get("rag_focus_files") or state.get("react_priority_files") or []
+        path_allow: frozenset[str] | None = None
+        if raw_focus:
+            path_allow = frozenset(
+                str(x).replace("\\", "/").strip()
+                for x in raw_focus
+                if str(x).strip()
+            )
+            if not path_allow:
+                path_allow = None
+            else:
+                logger.info(
+                    "[%s] Targeted RAG allowlist: %s path(s)",
+                    self.name,
+                    len(path_allow),
+                )
+
         pool: dict[tuple[str, int], dict] = {}
         
         # Gap 4: Entities Expansion limit natively!
@@ -134,6 +151,7 @@ class RetrieverAgent(BaseAgent):
                 indexed_symbol_hits=indexed_hits,
                 git_by_path=git_by_path or None,
                 focus_entities=focus_entities,
+                file_path_allowlist=path_allow,
             )
             merge_chunk_results(pool, part)
 

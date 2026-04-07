@@ -24,7 +24,7 @@ from typing import Optional
 
 import typer
 
-from app.cli.commands.ask import cmd_ask
+from app.cli.commands.ask import cmd_ask, cmd_edit, cmd_run
 from app.cli.commands.eval_command import cmd_eval
 from app.cli.commands.metrics import show_metrics
 from app.cli.commands.system import cmd_config, cmd_health, cmd_init_db, cmd_ingest
@@ -46,6 +46,9 @@ _SUBCOMMAND_NAMES = frozenset(
         "init-db",
         "ingest",
         "doctor",
+        "edit",
+        "run",
+        "open",
     }
 )
 
@@ -142,6 +145,104 @@ def cmd_doctor() -> None:
         console.print(f"[yellow]⚠ PostgreSQL:[/yellow] No active instance bounded!")
         
     console.print("\n[dim]All diagnostic checks passed. System behaves precisely.[/dim]")
+
+
+@app.command("edit")
+def edit_cli(
+    instruction: str = typer.Argument(..., help="What to change (explore → plan → patch)"),
+    debug: bool = typer.Option(False, "--debug", "-d", help="Include meta in output"),
+    context: Optional[str] = typer.Option(
+        None,
+        "--context",
+        "-c",
+        help="Optional extra context",
+    ),
+    repo_id: Optional[str] = typer.Option(
+        None,
+        "--repo",
+        "-r",
+        help="Ingested repo id",
+    ),
+    auto_apply: bool = typer.Option(
+        False,
+        "--auto-apply",
+        help="Apply patches without confirmation (use with care)",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Show diffs only; do not write files",
+    ),
+) -> None:
+    """Multi-file edit agent: tool-first exploration, structured plan, then patches."""
+    cmd_edit(
+        instruction,
+        debug=debug,
+        context=context,
+        repo_id=repo_id,
+        auto_apply=auto_apply,
+        dry_run=dry_run,
+    )
+
+
+@app.command("open")
+def open_cli(
+    path: Optional[Path] = typer.Option(
+        None,
+        "--path",
+        "-p",
+        help="Directory to browse (default: cwd)",
+    ),
+    repo_id: Optional[str] = typer.Option(
+        None,
+        "--repo",
+        "-r",
+        help="Ingested repo id (optional; logs manual saves to edit-learning memory)",
+    ),
+) -> None:
+    """Terminal file explorer + viewer/editor (mini IDE)."""
+    from app.cli.tui.file_explorer import run_file_explorer
+
+    root = str(path.resolve()) if path else str(Path.cwd().resolve())
+    run_file_explorer(root, repo_id=repo_id)
+
+
+@app.command("run")
+def run_cli(
+    goal: str = typer.Argument(..., help="High-level goal (decomposed into tasks)"),
+    debug: bool = typer.Option(False, "--debug", "-d", help="Include meta in output"),
+    context: Optional[str] = typer.Option(
+        None,
+        "--context",
+        "-c",
+        help="Optional extra context",
+    ),
+    repo_id: Optional[str] = typer.Option(
+        None,
+        "--repo",
+        "-r",
+        help="Ingested repo id",
+    ),
+    auto_apply: bool = typer.Option(
+        False,
+        "--auto-apply",
+        help="Apply patches without confirmation (use with care)",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Show diffs only; do not write files",
+    ),
+) -> None:
+    """Macro loop: LLM-decomposed tasks, each run in edit mode via the orchestrator."""
+    cmd_run(
+        goal,
+        debug=debug,
+        context=context,
+        repo_id=repo_id,
+        auto_apply=auto_apply,
+        dry_run=dry_run,
+    )
 
 
 @app.command("ask")

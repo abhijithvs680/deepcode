@@ -14,9 +14,9 @@ def apply_critic_action(state: dict[str, Any]) -> bool:
     action = feedback.get("action", "accept")
     mode = state.get("mode", "ask")
     
-    # Gap 4 Constraint limits: Build mode must reject expansion loops dynamically mitigating patches natively!
-    if mode == "build" and action == "expand_retrieval":
-        logger.warning("CriticExecutor preventing expand_retrieval looping natively during Build mode boundaries!")
+    # Edit mode: avoid expand_retrieval loops (keeps patch path deterministic).
+    if mode == "edit" and action == "expand_retrieval":
+        logger.warning("CriticExecutor: expand_retrieval suppressed in edit mode.")
         action = "retry"
         
     if action == "expand_retrieval":

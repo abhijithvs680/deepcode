@@ -234,6 +234,7 @@ async def search(
     indexed_symbol_hits: frozenset[str] | None = None,
     git_by_path: GitScoreMap | None = None,
     focus_entities: list[str] | None = None,
+    file_path_allowlist: frozenset[str] | None = None,
 ) -> list[dict]:
     fq = full_question if full_question is not None else query
     cache = embed_cache if embed_cache is not None else {}
@@ -290,6 +291,24 @@ async def search(
                     symbol_reason=s["symbol_reason"] + "|fallback_relaxed_threshold",
                 )
             )
+
+    scored_pre_allowlist = list(scored)
+    if file_path_allowlist:
+        norm = {x.replace("\\", "/").strip() for x in file_path_allowlist if x}
+        if norm:
+
+            def _path_in_focus(fp: str) -> bool:
+                p = str(fp).replace("\\", "/")
+                if p in norm:
+                    return True
+                return any(p.startswith(pref + "/") for pref in norm)
+
+            narrowed = [c for c in scored if _path_in_focus(c.get("file_path", ""))]
+            if narrowed:
+                scored = narrowed
+            else:
+                scored_pre_allowlist.sort(key=lambda x: x["score"], reverse=True)
+                scored = scored_pre_allowlist[:2]
 
     scored.sort(key=lambda x: x["score"], reverse=True)
     results = scored[:top_k]

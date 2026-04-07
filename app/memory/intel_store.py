@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
+from typing import Any
 
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -188,6 +189,177 @@ async def load_import_edges(
     result = await db.execute(stmt)
     rows = result.scalars().all()
     return [(r.source_file, r.target_file) for r in rows]
+
+
+def _norm_fp(p: str) -> str:
+    return str(p).replace("\\", "/").strip()
+
+
+async def get_file_dependency_targets(
+    db: AsyncSession,
+    repo_name: str,
+    file_path: str,
+    *,
+    limit: int = 40,
+) -> list[str]:
+    """Static import edges: files that `file_path` imports."""
+    if not repo_name or not file_path:
+        return []
+    fp = _norm_fp(file_path)
+    stmt = (
+        select(RepoImportEdge.target_file)
+        .where(
+            RepoImportEdge.repo_name == repo_name,
+            RepoImportEdge.source_file == fp,
+        )
+        .distinct()
+        .limit(limit)
+    )
+    rows = (await db.execute(stmt)).scalars().all()
+    return [_norm_fp(x) for x in rows if x]
+
+
+async def get_file_importers(
+    db: AsyncSession,
+    repo_name: str,
+    file_path: str,
+    *,
+    limit: int = 40,
+) -> list[str]:
+    """Files that import `file_path` (reverse edges)."""
+    if not repo_name or not file_path:
+        return []
+    fp = _norm_fp(file_path)
+    stmt = (
+        select(RepoImportEdge.source_file)
+        .where(
+            RepoImportEdge.repo_name == repo_name,
+            RepoImportEdge.target_file == fp,
+        )
+        .distinct()
+        .limit(limit)
+    )
+    rows = (await db.execute(stmt)).scalars().all()
+    return [_norm_fp(x) for x in rows if x]
+
+
+async def get_dependency_bundle_for_file(
+    db: AsyncSession,
+    repo_name: str,
+    file_path: str,
+    *,
+    limit_each: int = 25,
+) -> dict[str, list[str]]:
+    """Targets + importers for one file (graph neighborhood)."""
+    targets = await get_file_dependency_targets(
+        db, repo_name, file_path, limit=limit_each
+    )
+    importers = await get_file_importers(
+        db, repo_name, file_path, limit=limit_each
+    )
+    return {"imports": targets, "imported_by": importers}
+
+
+async def get_dependency_bundle_for_symbol(
+    db: AsyncSession,
+    repo_name: str,
+    symbol_name: str,
+    *,
+    limit_each: int = 20,
+) -> dict[str, Any]:
+    """Resolve symbol to file(s), then attach import neighborhood."""
+    matches = await lookup_repo_symbols(
+        db, repo_name, symbol_name, limit=8
+    )
+    if not matches:
+        return {"symbol": symbol_name, "matches": [], "graph": {}}
+    primary = _norm_fp(matches[0].get("file", ""))
+    graph: dict[str, dict[str, list[str]]] = {}
+    if primary:
+        graph[primary] = await get_dependency_bundle_for_file(
+            db, repo_name, primary, limit_each=limit_each
+        )
+    return {
+        "symbol": symbol_name,
+        "matches": matches,
+        "primary_file": primary,
+        "graph": graph,
+    }
+
+
+async def record_edit_learning(
+    db: AsyncSession,
+    repo_name: str,
+    *,
+    query: str,
+    files: list[str],
+    success: bool,
+    detail: str = "",
+) -> None:
+    """Persist edit outcomes for future routing bias (via decision log)."""
+    if not repo_name:
+        return
+    payload = json.dumps(
+        {
+            "query": (query or "")[:500],
+            "files": files[:12],
+            "success": success,
+            "detail": (detail or "")[:800],
+        },
+        default=str,
+    )
+    await store_decision(db, repo_name, "__edit_learning__", payload[:2400])
+
+
+async def fetch_edit_learning_file_bias(
+    db: AsyncSession,
+    repo_name: str,
+    query: str,
+    *,
+    limit_rows: int = 24,
+    max_files: int = 12,
+) -> list[str]:
+    """Ranked file paths from past edit-learning rows, weakly matched to the current query."""
+    if not repo_name or not query:
+        return []
+    from app.agents.react_grounding import keyword_relevance
+    from app.models.memory import AgentDecision
+
+    stmt = (
+        select(AgentDecision)
+        .where(AgentDecision.repo_name == repo_name)
+        .where(AgentDecision.symbol == "__edit_learning__")
+        .order_by(AgentDecision.timestamp.desc())
+        .limit(limit_rows)
+    )
+    result = await db.execute(stmt)
+    rows = list(result.scalars().all())
+    scored: list[tuple[float, str]] = []
+    for row in rows:
+        try:
+            payload = json.loads(row.decision_context)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not payload.get("success", True):
+            continue
+        pq = str(payload.get("query") or "")
+        rel_kw = keyword_relevance(query, pq)
+        for fp in payload.get("files") or []:
+            if isinstance(fp, str) and fp.strip():
+                scored.append((rel_kw, fp.replace("\\", "/")))
+    scored.sort(key=lambda x: -x[0])
+    out: list[str] = []
+    seen: set[str] = set()
+    for rel, fp in scored:
+        if fp in seen:
+            continue
+        if rel < 0.08 and len(out) >= 3:
+            continue
+        seen.add(fp)
+        out.append(fp)
+        if len(out) >= max_files:
+            break
+    return out
 
 
 async def fetch_chunks_for_files(

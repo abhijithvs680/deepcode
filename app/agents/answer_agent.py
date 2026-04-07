@@ -14,6 +14,7 @@ from app.tools.base_tool import ToolResult
 from app.memory.intel_store import fetch_symbol_anchor_text, fetch_git_context_text
 from app.memory.symbol_extract import extract_query_identifiers
 from app.core.config import get_settings
+from app.agents.react_grounding import may_emit_answer
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,28 @@ def _filter_tool_results_by_priority(
                 if isinstance(fp, str) and path_in_priority(fp):
                     return True
             return False
+        if action == "get_file_dependencies":
+            for k in ("imports", "imported_by"):
+                for fp in data.get(k) or []:
+                    if isinstance(fp, str) and path_in_priority(fp):
+                        return True
+            p = data.get("file")
+            if isinstance(p, str) and path_in_priority(p):
+                return True
+            return False
+        if action == "get_symbol_dependencies":
+            for m in data.get("matches") or []:
+                if not isinstance(m, dict):
+                    continue
+                fp = m.get("file")
+                if isinstance(fp, str) and path_in_priority(fp):
+                    return True
+            gph = data.get("graph")
+            if isinstance(gph, dict):
+                for fp0 in gph.keys():
+                    if isinstance(fp0, str) and path_in_priority(fp0):
+                        return True
+            return False
         return True
 
     out = [tr for tr in tool_results if touches(tr)]
@@ -100,24 +123,19 @@ class AnswerAgent(BaseAgent):
         tool_results_raw = state.get("tool_results", [])
         priority_files = state.get("react_priority_files") or []
 
-        if (
-            state.get("react_steps")
-            and not (state.get("files_read") or [])
-            and not (state.get("symbols_found") or [])
-            and not ranked_ctx
-            and not memories
-            and not tool_results_raw
-            and not state.get("write_enabled")
-            and state.get("mode", "ask") == "ask"
-        ):
-            msg = "Not enough information in the provided context."
-            state["answer"] = msg
-            state["latency_ms"] = 0.0
-            state["full_prompt"] = ""
-            state["context"] = ""
-            state["pieces_used"] = []
-            logger.info("[%s] Hard grounding gate: no files/symbols/RAG/tools", self.name)
-            return state
+        if state.get("mode", "ask") == "ask" and not state.get("write_enabled"):
+            if not may_emit_answer(state, ranked_ctx):
+                msg = "Not enough information in the provided context."
+                state["answer"] = msg
+                state["latency_ms"] = 0.0
+                state["full_prompt"] = ""
+                state["context"] = ""
+                state["pieces_used"] = []
+                logger.info(
+                    "[%s] Hard grounding gate: need file/symbol evidence or retrieved chunks",
+                    self.name,
+                )
+                return state
 
         tool_results = _filter_tool_results_by_priority(
             tool_results_raw,
@@ -166,6 +184,47 @@ class AnswerAgent(BaseAgent):
             
         import json
 
+        subgoal_traces = state.get("subgoal_traces") or []
+        if subgoal_traces:
+            sg_text = truncate_to_token_budget(
+                json.dumps(
+                    {"plan_goal": state.get("query", ""), "subgoals": subgoal_traces},
+                    indent=2,
+                    default=str,
+                ),
+                max_tokens=min(1800, self.settings.CONTEXT_BUDGET_TOOL + 400),
+            )
+            builder.add_context(
+                "Hierarchical subgoal traces (merge before answering)",
+                sg_text,
+                priority=93,
+            )
+            builder.add_context(
+                "Structured synthesis (mandatory when subgoals present)",
+                "Your answer MUST: (1) briefly summarize what each subgoal found; "
+                "(2) combine those findings into one coherent explanation; "
+                "(3) call out any conflicts or gaps between subgoals; "
+                "(4) give the final answer to the user's question using only the evidence above.",
+                priority=94,
+            )
+            logger.info(
+                "[%s] Injected %s subgoal trace bundle(s)",
+                self.name,
+                len(subgoal_traces),
+            )
+
+        xs = (state.get("cross_subgoal_summary") or "").strip()
+        if xs:
+            builder.add_context(
+                "Cross-subgoal synthesis (reconcile before answering)",
+                truncate_to_token_budget(
+                    xs,
+                    max_tokens=min(900, self.settings.CONTEXT_BUDGET_TOOL // 2),
+                ),
+                priority=95,
+            )
+            logger.info("[%s] Cross-subgoal synthesis injected", self.name)
+
         react_steps = state.get("react_steps") or []
         react_observations = state.get("react_observations") or []
         if react_steps or react_observations or (state.get("react_summary") or "").strip():
@@ -205,7 +264,7 @@ class AnswerAgent(BaseAgent):
         )
         if state.get("write_enabled"):
             grounding += (
-                "\nException for write mode: you may propose <patch> blocks only for "
+                "\nException for edit mode: you may propose <patch> blocks only for "
                 "file paths that appear in the evidence above."
             )
         builder.add_context("Grounding contract", grounding, priority=96)
@@ -224,14 +283,46 @@ class AnswerAgent(BaseAgent):
 
         if state.get("write_enabled"):
             sys_write = (
-                "WRITE MODE ENABLED:\n"
-                "You are authorized to modify files. If you generate code changes, you MUST output your proposed modifications using exactly the following syntax mapping the entire replacement file:\n\n"
+                "EDIT MODE ENABLED:\n"
+                "Prefer transactional search/replace (safer) when possible — exact "
+                "substring must exist in the file:\n\n"
+                "<edit file='relative/path.py'>\n"
+                "<search>exact code to find (include enough context to be unique)</search>\n"
+                "<replace>replacement code</replace>\n"
+                "</edit>\n\n"
+                "You may emit multiple <edit> blocks. If a whole-file rewrite is truly "
+                "required, you may instead use full-file patches:\n\n"
                 "<patch file='path/to/file'>\n"
                 "new file content entirely replacing original\n"
                 "</patch>\n\n"
-                "Generate a separate `<patch>` block for each file modified."
+                "Only reference paths that appear in Tool Execution Results, ReAct "
+                "exploration, Code intelligence, or the structured edit plan below."
             )
             builder.add_context("System Core Directives", sys_write, priority=110)
+            ep = state.get("edit_plan") or {}
+            if isinstance(ep, dict) and ep.get("plan"):
+                plan_blob = truncate_to_token_budget(
+                    json.dumps(ep, indent=2, default=str),
+                    max_tokens=min(1200, self.settings.CONTEXT_BUDGET_TOOL // 2),
+                )
+                builder.add_context(
+                    "Structured edit plan (follow unless evidence contradicts)",
+                    plan_blob,
+                    priority=109,
+                )
+            ec = state.get("edit_context") or {}
+            if isinstance(ec, dict) and (
+                ec.get("files") or ec.get("symbols") or ec.get("dependency_graph")
+            ):
+                ctx_blob = truncate_to_token_budget(
+                    json.dumps(ec, indent=2, default=str),
+                    max_tokens=min(900, self.settings.CONTEXT_BUDGET_TOOL // 3),
+                )
+                builder.add_context(
+                    "Edit context (files read + graph summary)",
+                    ctx_blob,
+                    priority=108,
+                )
             
         critic_fallback = state.get("critic_feedback")
         if critic_fallback:
