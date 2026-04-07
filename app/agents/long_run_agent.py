@@ -487,21 +487,24 @@ async def run_long_goal(
             except Exception as exc:
                 state["last_verification"] = {"success": False, "summary": str(exc)[:300]}
 
-        pd = str(getattr(settings, "LONG_RUN_PERSIST_DIR", "") or "").strip()
-        if pd:
-            _persist_long_run_state(
-                state,
-                persist_dir=pd,
-                repo_id=repo_id,
-                log_entry={
-                    "ts": time.time(),
-                    "cycle": state.get("cycle"),
-                    "task_id": task.get("id"),
-                    "task_status": task.get("status"),
-                    "confidence": state.get("last_task_confidence"),
-                    "goal_status": state.get("goal_status"),
-                },
-            )
+        if getattr(settings, "LONG_RUN_PERSIST_ENABLED", True):
+            pd = str(
+                getattr(settings, "LONG_RUN_PERSIST_DIR", "") or ".deepcode/runs"
+            ).strip()
+            if pd:
+                _persist_long_run_state(
+                    state,
+                    persist_dir=pd,
+                    repo_id=repo_id,
+                    log_entry={
+                        "ts": time.time(),
+                        "cycle": state.get("cycle"),
+                        "task_id": task.get("id"),
+                        "task_status": task.get("status"),
+                        "confidence": state.get("last_task_confidence"),
+                        "goal_status": state.get("goal_status"),
+                    },
+                )
 
         if is_goal_complete(state):
             state["goal_status"] = "completed"

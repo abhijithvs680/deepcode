@@ -367,12 +367,42 @@ async def finalize_react_edit_session(
         commit = False
     allow = _edit_allow_paths(state)
     try:
-        if commit and ed.has_pending_changes() and allow:
-            await registry.execute_tool(
-                "file_edit",
-                "commit_session",
-                allowed_files=sorted(allow)[:120],
-            )
+        if commit:
+            if ed.has_pending_changes() and allow:
+                await registry.execute_tool(
+                    "file_edit",
+                    "commit_session",
+                    allowed_files=sorted(allow)[:120],
+                )
+            else:
+                await registry.execute_tool("file_edit", "rollback_session")
+        elif (
+            bool(getattr(stg, "REACT_EDIT_ROLLBACK_TO_CHECKPOINT", True))
+            and ed.has_checkpoints()
+        ):
+            try:
+                await registry.execute_tool(
+                    "file_edit", "rollback_to_last_checkpoint"
+                )
+            except Exception:
+                await registry.execute_tool("file_edit", "rollback_session")
+            else:
+                if ed.has_pending_changes() and allow:
+                    try:
+                        await registry.execute_tool(
+                            "file_edit",
+                            "commit_session",
+                            allowed_files=sorted(allow)[:120],
+                        )
+                    except Exception as exc2:
+                        logger.warning(
+                            "finalize_react_edit_session partial commit: %s", exc2
+                        )
+                        await registry.execute_tool(
+                            "file_edit", "rollback_session"
+                        )
+                else:
+                    await registry.execute_tool("file_edit", "rollback_session")
         else:
             await registry.execute_tool("file_edit", "rollback_session")
     except Exception as exc:
@@ -419,7 +449,7 @@ Schema:
 {
   "thought": "short reasoning",
   "tool": "file" | "file_edit" | "git" | "log" | null,
-  "action": "read_file" | "search" | "list_dir" | "find_symbol" | "get_symbols" | "get_file_dependencies" | "get_symbol_dependencies" | "apply_search_replace" | "commit_session" | "rollback_session" | "done" | "git_log" | "git_blame" | "search_logs" | "get_recent_failures",
+  "action": "read_file" | "search" | "list_dir" | "find_symbol" | "get_symbols" | "get_file_dependencies" | "get_symbol_dependencies" | "apply_search_replace" | "checkpoint_session" | "commit_session" | "rollback_session" | "done" | "git_log" | "git_blame" | "search_logs" | "get_recent_failures",
   "args": { },
   "done": false
 }
@@ -430,9 +460,11 @@ Rules:
 - find_symbol: args {"name": "SymbolName"} — requires indexed repo
 - get_file_dependencies / get_symbol_dependencies before editing unknown modules.
 - search: args {"query": "snippet"} or {"queries": ["a","b"]}
-- file_edit.apply_search_replace: args {"file_path":"app/x.py","search":"exact snippet from file","replace":"new text","expected_occurrences":1}
+- file_edit.apply_search_replace: args {"file_path":"app/x.py","search":"exact snippet from file","replace":"new text","expected_occurrences":1,"dry_run":false}
+  Use dry_run true to preview a diff without changing the working copy; only non-dry edits are persisted on commit.
   Only edit files you already read_file in this subgoal (allowed paths are enforced).
   Edits are batched in memory and committed once at subgoal end if exploration succeeds; mid-subgoal commit_session is optional.
+- file_edit.checkpoint_session: args {} — save in-session edit state (used on subgoal failure to keep last good checkpoint).
 - file_edit.commit_session: args {"allowed_files":["app/x.py",...]} — force early persist (optional).
 - file_edit.rollback_session: args {} — discard uncommitted in-session edits.
 - git_log: args {} or {"file_path": "optional", "n": 10}
@@ -543,6 +575,13 @@ async def run_reasoning_loop(
         action_limits["apply_search_replace"] = 3
         action_limits["commit_session"] = 3
         action_limits["rollback_session"] = 2
+        action_limits["checkpoint_session"] = max(
+            1,
+            min(
+                int(getattr(settings, "REACT_EDIT_CHECKPOINT_MAX", 5) or 5),
+                12,
+            ),
+        )
         action_limits["begin_session"] = 0
     action_counts: dict[str, int] = defaultdict(int)
 
@@ -553,6 +592,7 @@ async def run_reasoning_loop(
     state["symbols_found"] = []
     state["react_useful_steps"] = 0
     state["react_failed_steps"] = 0
+    state["react_edit_line_estimate"] = 0
     state["react_force_rag"] = intent == "broad"
     state["file_scores"] = dict(state.get("file_scores") or {})
     file_scores: dict[str, float] = defaultdict(float)
@@ -780,6 +820,70 @@ async def run_reasoning_loop(
                     _maybe_force_rag_escape(state)
                     break
                 continue
+            if not args.get("dry_run"):
+                from app.tools.file_edit_tool import FileEditTool
+
+                fe_chk = registry.get_tool("file_edit")
+                max_f = int(
+                    getattr(settings, "EDIT_MAX_TOTAL_FILES_REACT", 0) or 0
+                )
+                max_l = int(
+                    getattr(settings, "EDIT_MAX_LINES_CHANGED_REACT", 0) or 0
+                )
+                fp_norm = str(fp_chk).replace("\\", "/").strip()
+                if isinstance(fe_chk, FileEditTool) and max_f > 0:
+                    touched = set(fe_chk.touched_files())
+                    prospective = len(touched) + (
+                        1 if fp_norm and fp_norm not in touched else 0
+                    )
+                    if prospective > max_f:
+                        state["react_observations"].append(
+                            f"Step {i}: edit budget — max {max_f} files per subgoal "
+                            f"(would touch {prospective})."
+                        )
+                        state["react_failed_steps"] += 1
+                        await _emit_step_evt(
+                            state,
+                            phase="result",
+                            step=i,
+                            tool=tool_name,
+                            action=action,
+                            status="fail",
+                            summary="edit file budget",
+                            duration_ms=0,
+                        )
+                        if state["react_failed_steps"] >= 2:
+                            _maybe_force_rag_escape(state)
+                            break
+                        continue
+                if max_l > 0:
+                    search_s = str(args.get("search") or "")
+                    repl_s = str(args.get("replace") or "")
+                    add_ln = max(
+                        len(search_s.splitlines()),
+                        len(repl_s.splitlines()),
+                    )
+                    cur_ln = int(state.get("react_edit_line_estimate") or 0)
+                    if cur_ln + add_ln > max_l:
+                        state["react_observations"].append(
+                            f"Step {i}: edit budget — max ~{max_l} lines changed per subgoal "
+                            f"(estimated {cur_ln + add_ln})."
+                        )
+                        state["react_failed_steps"] += 1
+                        await _emit_step_evt(
+                            state,
+                            phase="result",
+                            step=i,
+                            tool=tool_name,
+                            action=action,
+                            status="fail",
+                            summary="edit line budget",
+                            duration_ms=0,
+                        )
+                        if state["react_failed_steps"] >= 2:
+                            _maybe_force_rag_escape(state)
+                            break
+                        continue
 
         act_limit = action_limits.get(action, 2)
         if action_counts[action] >= act_limit:
@@ -832,7 +936,11 @@ async def run_reasoning_loop(
 
         useful = _tool_step_useful(res, q)
         if res and res.success and tool_name == "file_edit":
-            if action in ("apply_search_replace", "commit_session"):
+            if action in (
+                "apply_search_replace",
+                "commit_session",
+                "checkpoint_session",
+            ):
                 useful = True
         if useful:
             state["react_useful_steps"] += 1
@@ -914,6 +1022,47 @@ async def run_reasoning_loop(
                 sym = m.get("symbol")
                 if sym and sym not in state["symbols_found"]:
                     state["symbols_found"].append(sym)
+
+        if (
+            res
+            and res.success
+            and tool_name == "file"
+            and action == "read_file"
+        ):
+            rp = args.get("path") or args.get("file_path")
+            if rp:
+                await EventBus.emit(
+                    {
+                        "type": "agent_file_open",
+                        "path": str(rp).replace("\\", "/"),
+                        "workspace": getattr(registry, "workspace_root", ""),
+                        "subgoal_id": state.get("subgoal_id"),
+                    }
+                )
+
+        if (
+            res
+            and res.success
+            and tool_name == "file_edit"
+            and action == "apply_search_replace"
+            and not args.get("dry_run")
+        ):
+            ss = str(args.get("search") or "")
+            rr = str(args.get("replace") or "")
+            add_ln = max(len(ss.splitlines()), len(rr.splitlines()))
+            state["react_edit_line_estimate"] = int(
+                state.get("react_edit_line_estimate") or 0
+            ) + add_ln
+            conf_thr = float(
+                getattr(settings, "REACT_EDIT_CHECKPOINT_MIN_CONFIDENCE", 0.6)
+            )
+            if compute_answer_confidence(state) >= conf_thr:
+                try:
+                    await registry.execute_tool(
+                        "file_edit", "checkpoint_session"
+                    )
+                except Exception:
+                    pass
 
         if (
             compute_answer_confidence(state) >= 0.78

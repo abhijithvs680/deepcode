@@ -513,7 +513,10 @@ def merge_react_subgoal_results(
     parent_state["subgoal_confidence"] = {
         t["id"]: float(t["confidence"]) for t in subgoal_traces
     }
-    parent_state["active_working_set"] = build_active_working_set(subgoal_runs)
+    q_ws = (parent_state.get("query") or parent_state.get("current_step") or "").strip()
+    parent_state["active_working_set"] = build_active_working_set(
+        subgoal_runs, query=q_ws
+    )
     return parent_state, subgoal_traces
 
 
@@ -521,6 +524,7 @@ def build_active_working_set(
     subgoal_runs: list[tuple[Subgoal, dict[str, Any]]],
     *,
     max_files: int | None = None,
+    query: str = "",
 ) -> list[str]:
     """Recent subgoal files first, then merged frequency list + dep neighbors (capped)."""
     stg = get_settings()
@@ -565,7 +569,17 @@ def build_active_working_set(
         if p not in seen_out:
             seen_out.add(p)
             out.append(p)
-    return out[:cap]
+    out = out[:cap]
+    qtxt = (query or "").strip()
+    if qtxt:
+        scored: list[tuple[float, int, str]] = []
+        for idx, p in enumerate(out):
+            base = p.split("/")[-1] if p else ""
+            rel = keyword_relevance(qtxt, p, base.replace("_", " "))
+            scored.append((rel, idx, p))
+        scored.sort(key=lambda t: (-t[0], t[1]))
+        out = [t[2] for t in scored][:cap]
+    return out
 
 
 def dependency_graph_edge_total(

@@ -113,6 +113,16 @@ class Settings(BaseSettings):
     EDIT_MAX_AUTO_FILES: int = 5
     # LLM repair attempts after a failed transactional <edit> (each hunk)
     EDIT_MAX_REPAIR_ATTEMPTS: int = 2
+    # ReAct file_edit: max distinct files touched / approximate line delta per subgoal (0 = no limit)
+    EDIT_MAX_TOTAL_FILES_REACT: int = 8
+    EDIT_MAX_LINES_CHANGED_REACT: int = 500
+    # In-memory checkpoints during subgoal (rollback restores last checkpoint, not full wipe)
+    REACT_EDIT_CHECKPOINT_MAX: int = 5
+    REACT_EDIT_CHECKPOINT_MIN_CONFIDENCE: float = 0.6
+    REACT_EDIT_ROLLBACK_TO_CHECKPOINT: bool = True
+    # Copy files to disk under repo before commit_session writes
+    PRE_COMMIT_SNAPSHOT_ENABLED: bool = True
+    PRE_COMMIT_SNAPSHOT_DIR: str = ".deepcode/snapshots"
 
     # Multi-cycle macro goals (TUI /run, long_run_agent)
     LONG_RUN_ENABLED: bool = True
@@ -122,8 +132,9 @@ class Settings(BaseSettings):
     LONG_RUN_MAX_TOTAL_TOOL_STEPS: int = 0
     # After each task, run project tests if True (can be slow)
     LONG_RUN_POST_TASK_VERIFY: bool = False
-    # Set non-empty to persist task_graph.json / artifacts.json / execution_log.jsonl per /run
-    LONG_RUN_PERSIST_DIR: str = ""
+    # Macro run persistence (set LONG_RUN_PERSIST_ENABLED=False to disable all disk writes)
+    LONG_RUN_PERSIST_ENABLED: bool = True
+    LONG_RUN_PERSIST_DIR: str = ".deepcode/runs"
 
 
 @lru_cache()

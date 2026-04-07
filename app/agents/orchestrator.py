@@ -559,7 +559,9 @@ class AgentOrchestrator:
                                         )
                                     subgoal_runs.append((sg, sub))
                                     state["active_working_set"] = (
-                                        build_active_working_set(subgoal_runs)
+                                        build_active_working_set(
+                                            subgoal_runs, query=q_for_plan
+                                        )
                                     )
                                     state["global_insights"].append(
                                         extract_key_findings(sub)
@@ -619,12 +621,22 @@ class AgentOrchestrator:
                                                             for x in conf_fb[:5]
                                                         )
                                                     )[:400]
+                                                    _prio = (
+                                                        max(
+                                                            (
+                                                                sg.priority
+                                                                for sg in remaining
+                                                            ),
+                                                            default=0,
+                                                        )
+                                                        + 1
+                                                    )
                                                     remaining.insert(
                                                         0,
                                                         Subgoal(
                                                             "resolve_conflicts",
                                                             desc,
-                                                            99,
+                                                            _prio,
                                                         ),
                                                     )
                                                     state[

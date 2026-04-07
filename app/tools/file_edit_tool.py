@@ -1,11 +1,14 @@
 """
-Transactional search/replace edits with snapshot rollback and optional Python syntax check.
+Transactional search/replace edits with snapshot rollback, checkpoints, and optional pre-commit snapshots.
 """
 from __future__ import annotations
 
 import ast
+import copy
 import logging
 import os
+import shutil
+from datetime import datetime
 from difflib import unified_diff
 from typing import Any
 
@@ -35,12 +38,16 @@ class FileEditTool(Tool):
         self._working: dict[str, str] = {}
         self._active = False
         self._dry_run = False
+        self._checkpoints: list[tuple[dict[str, str], dict[str, str]]] = []
 
     def set_dry_run(self, enabled: bool) -> None:
         self._dry_run = bool(enabled)
 
     def has_active_session(self) -> bool:
         return self._active
+
+    def has_checkpoints(self) -> bool:
+        return bool(self._checkpoints)
 
     def has_pending_changes(self) -> bool:
         if not self._active:
@@ -76,6 +83,7 @@ class FileEditTool(Tool):
     def begin_session(self) -> None:
         self._original.clear()
         self._working.clear()
+        self._checkpoints.clear()
         self._active = True
 
     def _read(self, rel: str) -> str:
@@ -95,6 +103,42 @@ class FileEditTool(Tool):
             self._working[rel] = content
         return self._working[rel]
 
+    def checkpoint_session(self) -> ToolResult:
+        if not self._active:
+            return ToolResult(
+                tool=self.name,
+                action="checkpoint_session",
+                success=False,
+                error="No active session.",
+            )
+        self._checkpoints.append(
+            (copy.deepcopy(self._working), copy.deepcopy(self._original))
+        )
+        cap = int(getattr(get_settings(), "REACT_EDIT_CHECKPOINT_MAX", 5) or 5)
+        cap = max(1, min(cap, 12))
+        while len(self._checkpoints) > cap:
+            self._checkpoints.pop(0)
+        return ToolResult(
+            tool=self.name,
+            action="checkpoint_session",
+            success=True,
+            data={"checkpoints": len(self._checkpoints)},
+        )
+
+    def rollback_to_last_checkpoint(self) -> ToolResult:
+        if not self._checkpoints:
+            return self.rollback_session()
+        w, o = self._checkpoints.pop()
+        self._working = copy.deepcopy(w)
+        self._original = copy.deepcopy(o)
+        self._active = True
+        return ToolResult(
+            tool=self.name,
+            action="rollback_to_last_checkpoint",
+            success=True,
+            data={"checkpoints_remaining": len(self._checkpoints)},
+        )
+
     def apply_search_replace(
         self,
         file_path: str,
@@ -102,6 +146,7 @@ class FileEditTool(Tool):
         replace: str,
         *,
         expected_occurrences: int = 1,
+        dry_run: bool = False,
     ) -> ToolResult:
         if not self._active:
             if getattr(get_settings(), "REACT_SUBGOAL_EDIT_TRANSACTION", True):
@@ -130,22 +175,72 @@ class FileEditTool(Tool):
                 success=False,
                 error=f"search block occurrences={n}, expected={expected_occurrences}",
             )
-        self._working[rel] = w.replace(search, replace, expected_occurrences)
-        ok, err = validate_python_syntax(self._working[rel], rel)
+        new_content = w.replace(search, replace, expected_occurrences)
+        ok, err = validate_python_syntax(new_content, rel)
         if not ok:
-            self._working[rel] = w
             return ToolResult(
                 tool=self.name,
                 action="apply_search_replace",
                 success=False,
                 error=f"syntax check failed: {err}",
             )
+        if dry_run:
+            diff = "".join(
+                unified_diff(
+                    w.splitlines(keepends=True),
+                    new_content.splitlines(keepends=True),
+                    fromfile=f"a/{rel}",
+                    tofile=f"b/{rel}",
+                )
+            )
+            return ToolResult(
+                tool=self.name,
+                action="apply_search_replace",
+                success=True,
+                data={
+                    "file": rel,
+                    "dry_run": True,
+                    "bytes": len(new_content),
+                    "diff_preview": diff[:4000],
+                },
+            )
+        self._working[rel] = new_content
         return ToolResult(
             tool=self.name,
             action="apply_search_replace",
             success=True,
             data={"file": rel, "bytes": len(self._working[rel])},
         )
+
+    def _snapshot_files_before_write(
+        self, pairs: list[tuple[str, str]]
+    ) -> str | None:
+        stg = get_settings()
+        if not getattr(stg, "PRE_COMMIT_SNAPSHOT_ENABLED", True):
+            return None
+        rel_snap = str(getattr(stg, "PRE_COMMIT_SNAPSHOT_DIR", ".deepcode/snapshots") or ".deepcode/snapshots").strip("/\\")
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        snap_root = os.path.abspath(
+            os.path.join(self.repo_path, rel_snap.replace("\\", "/"), ts)
+        )
+        if not snap_root.startswith(self.repo_path):
+            return None
+        try:
+            os.makedirs(snap_root, exist_ok=True)
+            for rel, _ in pairs:
+                abs_p = os.path.abspath(os.path.join(self.repo_path, rel))
+                if not abs_p.startswith(self.repo_path) or not os.path.isfile(abs_p):
+                    continue
+                dst = os.path.join(snap_root, rel)
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copy2(abs_p, dst)
+            meta = os.path.join(snap_root, "_snapshot_meta.txt")
+            with open(meta, "w", encoding="utf-8") as f:
+                f.write(f"timestamp={ts}\nrepo={self.repo_path}\n")
+            return snap_root
+        except OSError as exc:
+            logger.warning("pre-commit snapshot failed: %s", exc)
+            return None
 
     def commit_session(self, allowed_files: set[str]) -> ToolResult:
         if not self._active:
@@ -181,6 +276,7 @@ class FileEditTool(Tool):
                 written = [r for r, _ in to_write]
                 self._working.clear()
                 self._original.clear()
+                self._checkpoints.clear()
                 self._active = False
                 return ToolResult(
                     tool=self.name,
@@ -188,6 +284,8 @@ class FileEditTool(Tool):
                     success=True,
                     data={"dry_run": True, "files_skipped": written},
                 )
+
+            snap = self._snapshot_files_before_write(to_write)
 
             for rel, content in to_write:
                 abs_p = os.path.abspath(os.path.join(self.repo_path, rel))
@@ -197,12 +295,16 @@ class FileEditTool(Tool):
             written = [r for r, _ in to_write]
             self._working.clear()
             self._original.clear()
+            self._checkpoints.clear()
             self._active = False
             return ToolResult(
                 tool=self.name,
                 action="commit_session",
                 success=True,
-                data={"files_written": written},
+                data={
+                    "files_written": written,
+                    "snapshot_dir": snap,
+                },
             )
         except Exception as e:
             return ToolResult(
@@ -226,10 +328,11 @@ class FileEditTool(Tool):
                 if not abs_p.startswith(self.repo_path):
                     continue
                 if os.path.isfile(abs_p):
-                    with open(abs_p, "w", encoding="utf-8", newline="") as f:
+                    with open(abs_p, "w", encoding="utf-8") as f:
                         f.write(content)
             self._working.clear()
             self._original.clear()
+            self._checkpoints.clear()
             self._active = False
             return ToolResult(
                 tool=self.name,
@@ -249,12 +352,17 @@ class FileEditTool(Tool):
         if action == "begin_session":
             self.begin_session()
             return ToolResult(tool=self.name, action=action, success=True, data={})
+        if action == "checkpoint_session":
+            return self.checkpoint_session()
+        if action == "rollback_to_last_checkpoint":
+            return self.rollback_to_last_checkpoint()
         if action == "apply_search_replace":
             return self.apply_search_replace(
                 kwargs.get("file_path", kwargs.get("path", "")),
                 kwargs.get("search", ""),
                 kwargs.get("replace", ""),
                 expected_occurrences=int(kwargs.get("expected_occurrences", 1)),
+                dry_run=bool(kwargs.get("dry_run")),
             )
         if action == "commit_session":
             af = kwargs.get("allowed_files") or []
