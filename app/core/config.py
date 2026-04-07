@@ -39,6 +39,8 @@ class Settings(BaseSettings):
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     # Large local models (e.g. 26B+) often exceed 120s on cold load + first token.
     OLLAMA_HTTP_TIMEOUT_S: float = 300.0
+    # Ollama /api/chat "think" flag. Gemma 4 / Qwen-style models need False or `message.content` stays empty.
+    OLLAMA_NATIVE_THINKING: bool = False
 
     # ── Embedding ─────────────────────────────────────────────────────────
     EMBEDDING_MODEL: str = "qwen3-embedding:8b"

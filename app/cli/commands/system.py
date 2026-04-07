@@ -60,6 +60,10 @@ def cmd_config() -> None:
     typer.echo(f"  Embed Model   : {settings.EMBEDDING_MODEL}")
     typer.echo(f"  Embed Dim     : {settings.EMBEDDING_DIMENSION} (must match Ollama vector length)")
     typer.echo(f"  Ollama URL    : {settings.OLLAMA_BASE_URL}")
+    typer.echo(
+        f"  Ollama think  : {getattr(settings, 'OLLAMA_NATIVE_THINKING', False)} "
+        "(False recommended for Gemma 4)"
+    )
     typer.echo(f"  Temperature   : {settings.LLM_TEMPERATURE}")
     typer.echo(f"  Max Tokens    : {settings.LLM_MAX_TOKENS}")
     typer.echo(f"  Database      : {settings.DATABASE_URL}")
