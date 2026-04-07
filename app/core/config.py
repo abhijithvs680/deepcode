@@ -89,6 +89,8 @@ class Settings(BaseSettings):
 
     # Orchestrator DAG safety cap (critic retries reset the workflow pointer)
     ORCHESTRATOR_MAX_ITERATIONS: int = 16
+    # Ask mode: if classifier confidence is below this, skip planner/ReAct/RAG and answer directly.
+    ORCHESTRATOR_LOW_SIGNAL_CONFIDENCE: float = 0.35
 
     # ReAct-style tool-first exploration (RAG only when context is insufficient)
     REACT_AGENT_ENABLED: bool = True

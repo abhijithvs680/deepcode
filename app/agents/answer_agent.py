@@ -14,7 +14,7 @@ from app.tools.base_tool import ToolResult
 from app.memory.intel_store import fetch_symbol_anchor_text, fetch_git_context_text
 from app.memory.symbol_extract import extract_query_identifiers
 from app.core.config import get_settings
-from app.agents.react_grounding import is_trivial_query, may_emit_answer
+from app.agents.react_grounding import is_trivial_query
 
 logger = logging.getLogger(__name__)
 
@@ -122,20 +122,6 @@ class AnswerAgent(BaseAgent):
         ctx_files = {c["file_path"].replace("\\", "/") for c in ranked_ctx[:18]}
         tool_results_raw = state.get("tool_results", [])
         priority_files = state.get("react_priority_files") or []
-
-        if state.get("mode", "ask") == "ask" and not state.get("write_enabled"):
-            if not may_emit_answer(state, ranked_ctx):
-                msg = "Not enough information in the provided context."
-                state["answer"] = msg
-                state["latency_ms"] = 0.0
-                state["full_prompt"] = ""
-                state["context"] = ""
-                state["pieces_used"] = []
-                logger.info(
-                    "[%s] Hard grounding gate: need file/symbol evidence or retrieved chunks",
-                    self.name,
-                )
-                return state
 
         tool_results = _filter_tool_results_by_priority(
             tool_results_raw,
@@ -261,13 +247,15 @@ class AnswerAgent(BaseAgent):
             )
         else:
             grounding = (
-                "GROUNDING (mandatory): Base your answer ONLY on ReAct exploration, "
-                "Tool Execution Results, Code intelligence / retrieved snippets, and "
-                "Cognitive Memory when present. Do not invent repository paths, symbols, "
-                "or behavior not supported by that evidence.\n"
-                "If the supplied context is insufficient to answer reliably, reply with "
-                "exactly this sentence and nothing else as the answer body: "
-                "Not enough information in the provided context."
+                "GROUNDING: Prefer ReAct exploration, Tool Execution Results, "
+                "Code intelligence / retrieved snippets, and Cognitive Memory when present. "
+                "Do not invent repository paths, symbols, or behavior not supported by that "
+                "evidence.\n"
+                "If context is thin, still give your best-effort answer: state what you "
+                "can infer, list reasonable next steps (e.g. which file or search to run), "
+                "and clearly label uncertainty. Do not refuse with a stock "
+                "\"not enough information\" phrase unless the user explicitly asked only "
+                "for facts that are completely absent from all supplied material."
             )
         if state.get("write_enabled"):
             grounding += (

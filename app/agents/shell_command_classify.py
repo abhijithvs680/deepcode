@@ -109,6 +109,10 @@ def classify_shell_risk(command: str) -> ShellRisk:
         return "read"
     low = c.lower()
 
+    # Pipe into a shell (curl | bash, wget | sh, …) — treat as destructive.
+    if re.search(r"\|\s*(?:/usr/bin/|/bin/|/usr/local/bin/)?(?:bash|sh)\b", low):
+        return "destructive"
+
     if any(x in low for x in _DEST_SUBSTR):
         return "destructive"
 

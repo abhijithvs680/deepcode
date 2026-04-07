@@ -49,6 +49,131 @@ class AgentOrchestrator:
         self._db = db
         self._interaction_logger = InteractionLogger(db) if db else None
 
+    async def _ask_mode_lightweight_reply(
+        self,
+        *,
+        question: str,
+        classification: dict,
+        session_id,
+        trace,
+        kwargs: dict,
+        status_cb,
+        repo_id: str | None,
+        state: dict,
+        status_message: str,
+        llm_prompt: str,
+        event_reason: str,
+        router_source: str,
+        rag_reason: str,
+        agent_intent: str,
+    ) -> dict:
+        """Direct LLM answer without planner, ReAct, or RAG (trivial or low-signal ask mode)."""
+        from app.agents.react_grounding import compute_answer_confidence
+        from app.core.event_bus import EventBus
+
+        if status_cb:
+            await status_cb(status_message)
+        t0 = time.perf_counter()
+        stream_cb = kwargs.get("stream_callback")
+        if stream_cb:
+            chunks: list[str] = []
+            async for ch in self._provider.stream_generate(llm_prompt):
+                chunks.append(ch)
+                await stream_cb(ch)
+            answer = "".join(chunks)
+        else:
+            answer = await self._provider.generate(llm_prompt)
+        latency_ms = (time.perf_counter() - t0) * 1000
+        state["answer"] = answer
+        state["latency_ms"] = latency_ms
+        state["full_prompt"] = llm_prompt
+        state["ranked_ctx"] = []
+        state["tool_results"] = []
+        state["context"] = ""
+        state["final_confidence"] = min(
+            0.95,
+            float(classification.get("confidence", 1.0) or 1.0),
+        )
+        if self._interaction_logger and session_id:
+            await self._interaction_logger.log_interaction(
+                session_id=session_id,
+                question=question,
+                context="",
+                full_prompt=llm_prompt,
+                answer=answer,
+                provider=self.settings.LLM_PROVIDER,
+                model=self.settings.LLM_MODEL,
+                latency_ms=latency_ms,
+            )
+        if self._db and repo_id:
+            from app.memory.intel_store import store_query
+
+            await store_query(
+                self._db,
+                repo_id,
+                question,
+                answer[:2500],
+                state.get("base_query_embed"),
+            )
+        cls_c = float(classification.get("confidence", 0.85) or 0.85)
+        await EventBus.emit(
+            {
+                "type": "fast_path",
+                "reason": event_reason,
+                "query": question[:500],
+            }
+        )
+        await EventBus.emit(
+            {
+                "type": "agent_status",
+                "confidence": cls_c,
+                "files_read": 0,
+                "symbols": 0,
+                "weak_grounding": False,
+                "subgoal_id": None,
+            }
+        )
+        return_dict = {
+            "answer": answer,
+            "session_id": session_id,
+            "latency_ms": latency_ms,
+            "model": self.settings.LLM_MODEL,
+            "provider": self.settings.LLM_PROVIDER,
+            "meta": {
+                "selected_tool": None,
+                "router_confidence": state.get("router_confidence"),
+                "router_source": router_source,
+                "retrieved_files": [],
+                "final_confidence": state["final_confidence"],
+                "classification": classification,
+                "agent_intent": agent_intent,
+                "fast_path": True,
+                "tool_steps_count": 0,
+                "rag_used": False,
+                "rag_reason": rag_reason,
+                "files_touched": [],
+                "symbols_used": [],
+                "answer_confidence": compute_answer_confidence(state),
+                "require_user_confirm": False,
+                "active_working_set": [],
+                "file_scores": {},
+                "global_insights": [],
+                "cross_subgoal_summary": "",
+                "early_stop_reason": "",
+                "react_early_stop_reason": "",
+            },
+        }
+        if trace:
+            return_dict["trace"] = trace.model_dump()
+        await EventBus.emit(
+            {
+                "type": "final_answer",
+                "content": answer,
+                "session_id": session_id,
+            }
+        )
+        return return_dict
+
     async def run(
         self,
         question: str,
@@ -370,113 +495,60 @@ class AgentOrchestrator:
             from app.core.event_bus import EventBus
 
             if mode == "ask" and is_trivial_query(question):
-                if status_cb:
-                    await status_cb("Quick reply (trivial query)…")
-                t0 = time.perf_counter()
                 prompt = (
                     "You are a helpful coding assistant. Reply briefly and naturally "
                     "(one short paragraph or less for greetings and tiny talk).\n\n"
                     f"User: {question}\nAssistant:"
                 )
-                stream_cb = kwargs.get("stream_callback")
-                if stream_cb:
-                    chunks: list[str] = []
-                    async for ch in self._provider.stream_generate(prompt):
-                        chunks.append(ch)
-                        await stream_cb(ch)
-                    answer = "".join(chunks)
-                else:
-                    answer = await self._provider.generate(prompt)
-                latency_ms = (time.perf_counter() - t0) * 1000
-                state["answer"] = answer
-                state["latency_ms"] = latency_ms
-                state["full_prompt"] = prompt
-                state["ranked_ctx"] = []
-                state["tool_results"] = []
-                state["context"] = ""
-                state["final_confidence"] = min(
-                    0.95,
-                    float(classification.get("confidence", 1.0) or 1.0),
+                return await self._ask_mode_lightweight_reply(
+                    question=question,
+                    classification=classification,
+                    session_id=session_id,
+                    trace=trace,
+                    kwargs=kwargs,
+                    status_cb=status_cb,
+                    repo_id=repo_id,
+                    state=state,
+                    status_message="Quick reply (trivial query)…",
+                    llm_prompt=prompt,
+                    event_reason="trivial_query",
+                    router_source="trivial_fast_path",
+                    rag_reason="trivial_fast_path",
+                    agent_intent="trivial",
                 )
-                if self._interaction_logger and session_id:
-                    await self._interaction_logger.log_interaction(
-                        session_id=session_id,
-                        question=question,
-                        context="",
-                        full_prompt=prompt,
-                        answer=answer,
-                        provider=self.settings.LLM_PROVIDER,
-                        model=self.settings.LLM_MODEL,
-                        latency_ms=latency_ms,
-                    )
-                if self._db and repo_id:
-                    from app.memory.intel_store import store_query
 
-                    await store_query(
-                        self._db,
-                        repo_id,
-                        question,
-                        answer[:2500],
-                        state.get("base_query_embed"),
-                    )
-                cls_c = float(classification.get("confidence", 0.85) or 0.85)
-                await EventBus.emit(
-                    {
-                        "type": "fast_path",
-                        "reason": "trivial_query",
-                        "query": question[:500],
-                    }
+            low_sig_thr = float(
+                getattr(self.settings, "ORCHESTRATOR_LOW_SIGNAL_CONFIDENCE", 0.35)
+                or 0.35
+            )
+            cls_c0 = float(classification.get("confidence", 1.0) or 1.0)
+            if mode == "ask" and cls_c0 < low_sig_thr:
+                prompt_ls = (
+                    "You are a helpful coding assistant. The query had a weak automatic "
+                    "match to the indexed codebase, so you are answering without loaded "
+                    "repository context. Be concise and helpful using general software "
+                    "knowledge; do not invent project-specific file paths, symbols, or "
+                    "internals you have not been given.\n\n"
+                    f"User: {question}\nAssistant:"
                 )
-                await EventBus.emit(
-                    {
-                        "type": "agent_status",
-                        "confidence": cls_c,
-                        "files_read": 0,
-                        "symbols": 0,
-                        "weak_grounding": False,
-                        "subgoal_id": None,
-                    }
+                return await self._ask_mode_lightweight_reply(
+                    question=question,
+                    classification=classification,
+                    session_id=session_id,
+                    trace=trace,
+                    kwargs=kwargs,
+                    status_cb=status_cb,
+                    repo_id=repo_id,
+                    state=state,
+                    status_message="Direct reply (weak query signal)…",
+                    llm_prompt=prompt_ls,
+                    event_reason="low_classification_confidence",
+                    router_source="low_signal_fast_path",
+                    rag_reason="low_classification_bypass",
+                    agent_intent=str(
+                        classification.get("agent_intent") or "exploratory"
+                    ),
                 )
-                return_dict = {
-                    "answer": answer,
-                    "session_id": session_id,
-                    "latency_ms": latency_ms,
-                    "model": self.settings.LLM_MODEL,
-                    "provider": self.settings.LLM_PROVIDER,
-                    "meta": {
-                        "selected_tool": None,
-                        "router_confidence": state.get("router_confidence"),
-                        "router_source": "trivial_fast_path",
-                        "retrieved_files": [],
-                        "final_confidence": state["final_confidence"],
-                        "classification": classification,
-                        "agent_intent": "trivial",
-                        "fast_path": True,
-                        "tool_steps_count": 0,
-                        "rag_used": False,
-                        "rag_reason": "trivial_fast_path",
-                        "files_touched": [],
-                        "symbols_used": [],
-                        "answer_confidence": compute_answer_confidence(state),
-                        "require_user_confirm": False,
-                        "active_working_set": [],
-                        "file_scores": {},
-                        "global_insights": [],
-                        "cross_subgoal_summary": "",
-                        "early_stop_reason": "",
-                        "react_early_stop_reason": "",
-                    },
-                }
-                if trace:
-                    return_dict["trace"] = trace.model_dump()
-                await EventBus.emit(
-                    {
-                        "type": "final_answer",
-                        "content": answer,
-                        "session_id": session_id,
-                    }
-                )
-                return return_dict
 
             # Phase 6: Autonomous Memory mapped natively explicitly into state
             if status_cb: await status_cb("🧠 Analyzing historical vectors natively...")

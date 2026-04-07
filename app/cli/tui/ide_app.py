@@ -31,6 +31,41 @@ from app.core.config import get_settings
 settings = get_settings()
 
 
+def _normalize_unified_diff_header_path(token: str) -> str | None:
+    t = token.strip().split("\t", 1)[0].strip()
+    if not t or t in ("/dev/null", "-", "null", "NUL"):
+        return None
+    for prefix in ("a/", "b/", "i/", "w/", "c/"):
+        if t.startswith(prefix):
+            return t[len(prefix) :].replace("\\", "/")
+    return t.replace("\\", "/")
+
+
+def _paths_from_unified_diff(diff: str) -> set[str]:
+    out: set[str] = set()
+    for line in (diff or "").splitlines():
+        s = line.strip("\r")
+        if s.startswith("--- ") or s.startswith("+++ "):
+            p = _normalize_unified_diff_header_path(s[4:])
+            if p:
+                out.add(p)
+    return out
+
+
+def _diff_covers_active_path(diff: str, active_rel: str) -> bool:
+    """True if unified diff headers reference the same repo-relative path as active_rel."""
+    if not diff or not active_rel or active_rel == "_session":
+        return False
+    want = active_rel.replace("\\", "/").strip().lstrip("./")
+    if not want:
+        return False
+    for p in _paths_from_unified_diff(diff):
+        pn = p.strip().lstrip("./")
+        if pn == want or pn.endswith("/" + want) or want.endswith("/" + pn):
+            return True
+    return False
+
+
 class DeepCodeIdeApp(App):
     """Grid-style agent IDE: same orchestrator as classic TUI, IDE-centric state + panels."""
 
@@ -372,12 +407,11 @@ class DeepCodeIdeApp(App):
     def _session_diff_references_path(session_diff: str, af: str) -> bool:
         if not session_diff or not af or af == "_session":
             return False
-        a = af.replace("\\", "/")
-        blob = session_diff.replace("\\", "/")
-        if a in blob:
+        a = af.replace("\\", "/").strip()
+        if _diff_covers_active_path(session_diff, a):
             return True
-        base = Path(a).name
-        return bool(base) and base in blob
+        blob = session_diff.replace("\\", "/")
+        return a in blob
 
     def _resolve_diff_raw_for_active(self) -> str:
         s = self.ide_state

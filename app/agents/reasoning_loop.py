@@ -12,6 +12,7 @@ import logging
 import re
 import time
 from collections import defaultdict
+from pathlib import Path
 from typing import Any
 
 from app.agents.react_grounding import (
@@ -27,6 +28,38 @@ from app.tools.base_tool import ToolResult
 from app.tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
+
+_ERR_FILE_RE = re.compile(
+    r'File "([^"]+\.(?:py|pyw|js|mjs|cjs|ts|tsx|jsx|java|kt|kts|rs|go|rb|php|cs|fs|cpp|cc|c|h|hpp|vue))"',
+    re.IGNORECASE,
+)
+
+
+def _try_repo_relative(path_str: str, workspace_root: str) -> str | None:
+    if not path_str or not workspace_root:
+        return None
+    try:
+        p = Path(str(path_str).strip()).expanduser()
+        root = Path(workspace_root).resolve()
+        if not p.is_absolute():
+            return _norm_rel_path(str(p))
+        pr = p.resolve()
+        rel = pr.relative_to(root)
+        return str(rel).replace("\\", "/")
+    except (ValueError, OSError):
+        return None
+
+
+def _scrape_error_paths_from_observation(ob: str) -> set[str]:
+    ol = (ob or "").lower()
+    if not ob or (
+        "traceback" not in ol
+        and "error" not in ol
+        and "syntaxerror" not in ol
+        and "exception" not in ol
+    ):
+        return set()
+    return {m.group(1).replace("\\", "/") for m in _ERR_FILE_RE.finditer(ob)}
 
 
 def _parse_json_object(text: str) -> dict[str, Any] | None:
@@ -253,7 +286,7 @@ def _bump_file_scores(
     if tool_name == "file_edit" and action == "apply_search_replace":
         fp = data.get("file") or args.get("file_path") or args.get("path")
         if fp:
-            add_path(str(fp), 2.5)
+            add_path(str(fp), 4.0)
         return
     if tool_name == "file_edit" and action == "commit_session":
         for fp in data.get("files_written") or []:
@@ -629,6 +662,9 @@ async def run_reasoning_loop(
         )
         action_limits["begin_session"] = 0
     action_counts: dict[str, int] = defaultdict(int)
+
+    state["react_edited_paths"] = []
+    state["react_error_paths"] = []
 
     state["react_steps"] = []
     state["react_observations"] = []
@@ -1029,6 +1065,14 @@ async def run_reasoning_loop(
         elif res and res.error:
             ob += f" error={res.error[:400]}"
         state["react_observations"].append(ob)
+        ws_root = getattr(registry, "workspace_root", "") or ""
+        for raw_path in _scrape_error_paths_from_observation(ob):
+            rel = _try_repo_relative(raw_path, ws_root)
+            key = rel or _norm_rel_path(raw_path)
+            if key:
+                err_list = state.setdefault("react_error_paths", [])
+                if key not in err_list:
+                    err_list.append(key)
 
         dur_ms = int((time.perf_counter() - t0) * 1000)
         await _emit_step_evt(
@@ -1133,6 +1177,12 @@ async def run_reasoning_loop(
             and action == "apply_search_replace"
             and not args.get("dry_run")
         ):
+            fp_ed = args.get("file_path") or args.get("path")
+            if fp_ed:
+                ep = _norm_rel_path(str(fp_ed))
+                elst = state.setdefault("react_edited_paths", [])
+                if ep and ep not in elst:
+                    elst.append(ep)
             ss = str(args.get("search") or "")
             rr = str(args.get("replace") or "")
             add_ln = max(len(ss.splitlines()), len(rr.splitlines()))
@@ -1215,6 +1265,20 @@ async def run_reasoning_loop(
         state["react_early_stop_reason"] = "max_steps_exhausted"
 
     final_i = max(last_loop_i, 0)
+    ws_merge = getattr(registry, "workspace_root", "") or ""
+    for raw_ed in state.get("react_edited_paths") or []:
+        pk = _norm_rel_path(str(raw_ed))
+        if pk:
+            file_scores[pk] = file_scores.get(pk, 0.0) + 3.0
+    seen_err_boost: set[str] = set()
+    for raw_er in state.get("react_error_paths") or []:
+        rel = _try_repo_relative(str(raw_er), ws_merge)
+        pk = rel or _norm_rel_path(str(raw_er))
+        if not pk or pk in seen_err_boost:
+            continue
+        seen_err_boost.add(pk)
+        file_scores[pk] = file_scores.get(pk, 0.0) + 4.0
+
     for p in list(file_scores.keys()):
         staleness = final_i - last_touch_step.get(p, final_i)
         if staleness > 0:

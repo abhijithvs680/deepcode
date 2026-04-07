@@ -18,8 +18,12 @@ def normalize_paths(paths: list[str], cap: int) -> list[str]:
     return out
 
 
-def coalesce_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Keep last agent_status / state per batch; preserve order for others."""
+def coalesce_events(
+    events: list[dict[str, Any]],
+    *,
+    max_step_events: int = 48,
+) -> list[dict[str, Any]]:
+    """Keep last agent_status / state per batch; cap high-frequency step events."""
     out: list[dict[str, Any]] = []
     pending_as: dict[str, Any] | None = None
     pending_state: dict[str, Any] | None = None
@@ -44,7 +48,11 @@ def coalesce_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
         flush_pending()
         out.append(ev)
     flush_pending()
-    return out
+    non_steps = [e for e in out if e.get("type") != "step"]
+    steps = [e for e in out if e.get("type") == "step"]
+    if len(steps) > max_step_events:
+        steps = steps[-max_step_events:]
+    return non_steps + steps
 
 
 class IdeEventDebouncer:
