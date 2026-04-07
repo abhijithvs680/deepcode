@@ -71,22 +71,47 @@ class AgentOrchestrator:
         from app.agents.react_grounding import compute_answer_confidence
         from app.core.event_bus import EventBus
 
+        full_prompt = llm_prompt
+        if self._interaction_logger and session_id:
+            try:
+                hist = await self._interaction_logger.get_session_history(
+                    session_id
+                )
+                tail = hist[-4:]
+                lines: list[str] = []
+                for h in tail:
+                    role = str(h.get("role") or "")
+                    c = str(h.get("content") or "").strip()
+                    if not c:
+                        continue
+                    label = "User" if role == "user" else "Assistant"
+                    lines.append(f"{label}: {c[:600]}")
+                if lines:
+                    full_prompt = (
+                        "Recent conversation (for continuity):\n"
+                        + "\n".join(lines)
+                        + "\n\n---\n\n"
+                        + llm_prompt
+                    )
+            except Exception as exc:
+                logger.debug("fast_path session history: %s", exc)
+
         if status_cb:
             await status_cb(status_message)
         t0 = time.perf_counter()
         stream_cb = kwargs.get("stream_callback")
         if stream_cb:
             chunks: list[str] = []
-            async for ch in self._provider.stream_generate(llm_prompt):
+            async for ch in self._provider.stream_generate(full_prompt):
                 chunks.append(ch)
                 await stream_cb(ch)
             answer = "".join(chunks)
         else:
-            answer = await self._provider.generate(llm_prompt)
+            answer = await self._provider.generate(full_prompt)
         latency_ms = (time.perf_counter() - t0) * 1000
         state["answer"] = answer
         state["latency_ms"] = latency_ms
-        state["full_prompt"] = llm_prompt
+        state["full_prompt"] = full_prompt
         state["ranked_ctx"] = []
         state["tool_results"] = []
         state["context"] = ""
@@ -99,7 +124,7 @@ class AgentOrchestrator:
                 session_id=session_id,
                 question=question,
                 context="",
-                full_prompt=llm_prompt,
+                full_prompt=full_prompt,
                 answer=answer,
                 provider=self.settings.LLM_PROVIDER,
                 model=self.settings.LLM_MODEL,
@@ -491,7 +516,11 @@ class AgentOrchestrator:
         try:
             status_cb = kwargs.get("status_callback") if "kwargs" in locals() else state.get("status_callback")
 
-            from app.agents.react_grounding import compute_answer_confidence, is_trivial_query
+            from app.agents.react_grounding import (
+                compute_answer_confidence,
+                is_trivial_query,
+                looks_like_repo_exploration_query,
+            )
             from app.core.event_bus import EventBus
 
             if mode == "ask" and is_trivial_query(question):
@@ -523,32 +552,46 @@ class AgentOrchestrator:
             )
             cls_c0 = float(classification.get("confidence", 1.0) or 1.0)
             if mode == "ask" and cls_c0 < low_sig_thr:
-                prompt_ls = (
-                    "You are a helpful coding assistant. The query had a weak automatic "
-                    "match to the indexed codebase, so you are answering without loaded "
-                    "repository context. Be concise and helpful using general software "
-                    "knowledge; do not invent project-specific file paths, symbols, or "
-                    "internals you have not been given.\n\n"
-                    f"User: {question}\nAssistant:"
-                )
-                return await self._ask_mode_lightweight_reply(
-                    question=question,
-                    classification=classification,
-                    session_id=session_id,
-                    trace=trace,
-                    kwargs=kwargs,
-                    status_cb=status_cb,
-                    repo_id=repo_id,
-                    state=state,
-                    status_message="Direct reply (weak query signal)…",
-                    llm_prompt=prompt_ls,
-                    event_reason="low_classification_confidence",
-                    router_source="low_signal_fast_path",
-                    rag_reason="low_classification_bypass",
-                    agent_intent=str(
-                        classification.get("agent_intent") or "exploratory"
-                    ),
-                )
+                if looks_like_repo_exploration_query(question):
+                    state["react_low_signal_repo_probe"] = True
+                    state["react_probe_max_steps"] = max(
+                        1,
+                        int(
+                            getattr(
+                                self.settings,
+                                "REACT_LOW_SIGNAL_PROBE_MAX_STEPS",
+                                1,
+                            )
+                            or 1
+                        ),
+                    )
+                else:
+                    prompt_ls = (
+                        "You are a helpful coding assistant. The query had a weak automatic "
+                        "match to the indexed codebase, so you are answering without loaded "
+                        "repository context. Be concise and helpful using general software "
+                        "knowledge; do not invent project-specific file paths, symbols, or "
+                        "internals you have not been given.\n\n"
+                        f"User: {question}\nAssistant:"
+                    )
+                    return await self._ask_mode_lightweight_reply(
+                        question=question,
+                        classification=classification,
+                        session_id=session_id,
+                        trace=trace,
+                        kwargs=kwargs,
+                        status_cb=status_cb,
+                        repo_id=repo_id,
+                        state=state,
+                        status_message="Direct reply (weak query signal)…",
+                        llm_prompt=prompt_ls,
+                        event_reason="low_classification_confidence",
+                        router_source="low_signal_fast_path",
+                        rag_reason="low_classification_bypass",
+                        agent_intent=str(
+                            classification.get("agent_intent") or "exploratory"
+                        ),
+                    )
 
             # Phase 6: Autonomous Memory mapped natively explicitly into state
             if status_cb: await status_cb("🧠 Analyzing historical vectors natively...")
@@ -686,13 +729,28 @@ class AgentOrchestrator:
                                 )
                             )
 
+                            react_ms = int(self.settings.REACT_MAX_STEPS)
+                            if state.get("react_low_signal_repo_probe"):
+                                react_ms = max(
+                                    1,
+                                    int(
+                                        state.get("react_probe_max_steps")
+                                        or getattr(
+                                            self.settings,
+                                            "REACT_LOW_SIGNAL_PROBE_MAX_STEPS",
+                                            1,
+                                        )
+                                        or 1
+                                    ),
+                                )
+
                             if not hierarchical:
                                 try:
                                     state = await run_reasoning_loop(
                                         state,
                                         self._provider,
                                         reg,
-                                        max_steps=self.settings.REACT_MAX_STEPS,
+                                        max_steps=react_ms,
                                     )
                                 finally:
                                     await finalize_react_edit_session(
@@ -700,6 +758,8 @@ class AgentOrchestrator:
                                         state,
                                         commit=subgoal_success(state),
                                     )
+                                    state.pop("react_low_signal_repo_probe", None)
+                                    state.pop("react_probe_max_steps", None)
                             else:
                                 state.setdefault("global_insights", [])
                                 state.setdefault(
@@ -738,12 +798,32 @@ class AgentOrchestrator:
                                         }
                                     )
                                     sub = create_substate(state, sg)
+                                    sub_ms = int(self.settings.REACT_MAX_STEPS)
+                                    if (
+                                        state.get("react_low_signal_repo_probe")
+                                        and not subgoal_runs
+                                    ):
+                                        pms = max(
+                                            1,
+                                            int(
+                                                state.get("react_probe_max_steps")
+                                                or getattr(
+                                                    self.settings,
+                                                    "REACT_LOW_SIGNAL_PROBE_MAX_STEPS",
+                                                    1,
+                                                )
+                                                or 1
+                                            ),
+                                        )
+                                        sub["react_low_signal_repo_probe"] = True
+                                        sub["react_probe_max_steps"] = pms
+                                        sub_ms = pms
                                     try:
                                         sub = await run_reasoning_loop(
                                             sub,
                                             self._provider,
                                             reg,
-                                            max_steps=self.settings.REACT_MAX_STEPS,
+                                            max_steps=sub_ms,
                                         )
                                     finally:
                                         await finalize_react_edit_session(
@@ -886,6 +966,8 @@ class AgentOrchestrator:
                                     prior_tool_results=prior_tools,
                                     subgoal_runs=subgoal_runs,
                                 )
+                                state.pop("react_low_signal_repo_probe", None)
+                                state.pop("react_probe_max_steps", None)
                                 if hierarchical and len(_traces) >= 2:
                                     from app.agents.cross_subgoal_synthesis import (
                                         synthesize_cross_subgoals,
@@ -1095,6 +1177,8 @@ class AgentOrchestrator:
                             continue
 
                         # Legacy: parallel one-shot tool + RAG (or plan mode)
+                        state.pop("react_low_signal_repo_probe", None)
+                        state.pop("react_probe_max_steps", None)
                         rc = float(state.get("router_confidence") or 0.0)
                         tool_conf_high = rc > 0.90
                         rag_bypass_types = {"git"}

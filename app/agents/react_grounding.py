@@ -103,6 +103,75 @@ _CODEISH_HINTS = frozenset(
 )
 
 
+def looks_like_repo_exploration_query(query: str) -> bool:
+    """
+    Low classifier confidence should not block obvious codebase navigation questions.
+    """
+    q = (query or "").lower().strip()
+    if len(q) < 8 or len(q) > 500:
+        return False
+    if any(
+        p in q
+        for p in (
+            "where is",
+            "where's",
+            "which file",
+            "which module",
+            "find the",
+            "find where",
+            "how does",
+            "how do i",
+            "how is",
+            "point me to",
+            "locate ",
+            "definition of",
+            "entry point",
+            "auth logic",
+            "login flow",
+            "login work",
+        )
+    ):
+        return True
+    if ("find " in q or "search " in q) and any(
+        x in q for x in ("file", "class", "function", "symbol", "code", "module")
+    ):
+        return True
+    return False
+
+
+def looks_like_task_execution_query(query: str) -> bool:
+    """User wants to run tests, installs, or checks — shell tool may apply (ask mode)."""
+    q = (query or "").lower()
+    if len(q) > 400:
+        return False
+    needles = (
+        "pytest",
+        "npm install",
+        "npm run",
+        "npm test",
+        "yarn ",
+        "pnpm ",
+        "pip install",
+        "pip3 install",
+        "poetry install",
+        "poetry run",
+        "cargo test",
+        "cargo build",
+        "make test",
+        "tox",
+        "ruff ",
+        "mypy ",
+        "eslint ",
+        "py_compile",
+        "python -m pytest",
+        "python -m compile",
+        "dotnet test",
+        "gradle test",
+        "mvn test",
+    )
+    return any(n in q for n in needles)
+
+
 def is_trivial_query(query: str) -> bool:
     """
     Very short, non-code queries (e.g. greetings) — skip heavy ReAct / grounding gates.

@@ -333,6 +333,9 @@ class DeepCodeIdeApp(App):
             self._mount_chat(chatfmt.error_block("Nothing to copy or clipboard failed."))
 
     def _on_debounced_events(self, batch: list[dict]) -> None:
+        self._ide_focus_editor_after_refresh = any(
+            e.get("type") == "agent_file_open" for e in batch
+        )
         for ev in batch:
             self.ide_state.apply_event(ev)
         self.call_next(self._refresh_all_panels)
@@ -398,6 +401,12 @@ class DeepCodeIdeApp(App):
                 ed.remove_children()
                 body = self._editor_markup()
                 ed.mount(Static(body, classes="chat-line"))
+                if getattr(self, "_ide_focus_editor_after_refresh", False):
+                    self._ide_focus_editor_after_refresh = False
+                    try:
+                        ed.focus()
+                    except Exception:
+                        pass
             except Exception:
                 pass
 

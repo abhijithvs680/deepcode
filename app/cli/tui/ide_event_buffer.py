@@ -4,6 +4,38 @@ from __future__ import annotations
 from typing import Any, Callable
 
 
+def _select_step_events(
+    steps: list[dict[str, Any]], max_n: int
+) -> list[dict[str, Any]]:
+    """Keep first, last, last failed result (+ its start), then recent middle."""
+    if len(steps) <= max_n:
+        return steps
+    last_fail_i: int | None = None
+    for i in range(len(steps) - 1, -1, -1):
+        s = steps[i]
+        if s.get("phase") != "result":
+            continue
+        if str(s.get("status") or "").lower() == "fail":
+            last_fail_i = i
+            break
+    keep: set[int] = {0, len(steps) - 1}
+    if last_fail_i is not None:
+        keep.add(last_fail_i)
+        if last_fail_i > 0:
+            prev = steps[last_fail_i - 1]
+            if (
+                prev.get("phase") == "start"
+                and prev.get("step") == steps[last_fail_i].get("step")
+            ):
+                keep.add(last_fail_i - 1)
+    rest_i = [i for i in range(len(steps)) if i not in keep]
+    need = max_n - len(keep)
+    if need > 0:
+        keep.update(rest_i[-need:])
+    ordered = sorted(keep)
+    return [steps[i] for i in ordered]
+
+
 def normalize_paths(paths: list[str], cap: int) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
@@ -50,8 +82,7 @@ def coalesce_events(
     flush_pending()
     non_steps = [e for e in out if e.get("type") != "step"]
     steps = [e for e in out if e.get("type") == "step"]
-    if len(steps) > max_step_events:
-        steps = steps[-max_step_events:]
+    steps = _select_step_events(steps, max_step_events)
     return non_steps + steps
 
 

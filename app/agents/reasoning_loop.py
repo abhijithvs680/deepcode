@@ -20,6 +20,7 @@ from app.agents.react_grounding import (
     extract_goal,
     goal_progress_delta,
     keyword_relevance,
+    looks_like_task_execution_query,
 )
 from app.core.config import get_settings
 from app.core.event_bus import EventBus
@@ -29,9 +30,17 @@ from app.tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
 
-_ERR_FILE_RE = re.compile(
-    r'File "([^"]+\.(?:py|pyw|js|mjs|cjs|ts|tsx|jsx|java|kt|kts|rs|go|rb|php|cs|fs|cpp|cc|c|h|hpp|vue))"',
-    re.IGNORECASE,
+_EXT = r"(?:py|pyw|js|mjs|cjs|ts|tsx|jsx|java|kt|kts|rs|go|rb|php|cs|fs|cpp|cc|c|h|hpp|vue)"
+_ERR_PATH_RES: tuple[re.Pattern[str], ...] = (
+    re.compile(r'File "([^"]+)"', re.IGNORECASE),
+    re.compile(
+        rf"\bat\s+(\S+?\.{_EXT})(?::\d+){{1,3}}\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"(?<![\w/])([/.][^\s:|<>\"]+\.{_EXT})(?::\d+)?\b",
+        re.IGNORECASE,
+    ),
 )
 
 
@@ -51,15 +60,30 @@ def _try_repo_relative(path_str: str, workspace_root: str) -> str | None:
 
 
 def _scrape_error_paths_from_observation(ob: str) -> set[str]:
-    ol = (ob or "").lower()
-    if not ob or (
-        "traceback" not in ol
-        and "error" not in ol
-        and "syntaxerror" not in ol
-        and "exception" not in ol
-    ):
+    if not ob or len(ob) > 500_000:
         return set()
-    return {m.group(1).replace("\\", "/") for m in _ERR_FILE_RE.finditer(ob)}
+    ol = (ob or "").lower()
+    if not any(
+        x in ol
+        for x in (
+            "traceback",
+            "error",
+            "syntaxerror",
+            "exception",
+            "failed",
+            "fail",
+            "stack",
+            "errno",
+        )
+    ) and 'file "' not in ol:
+        return set()
+    out: set[str] = set()
+    for rx in _ERR_PATH_RES:
+        for m in rx.finditer(ob):
+            p = m.group(1).replace("\\", "/").strip()
+            if p and 2 < len(p) < 400 and not p.startswith("http"):
+                out.add(p)
+    return out
 
 
 def _parse_json_object(text: str) -> dict[str, Any] | None:
@@ -620,13 +644,32 @@ async def run_reasoning_loop(
         state["react_force_rag"] = True
         max_steps = min(max_steps, 1)
 
+    if bool(state.get("react_low_signal_repo_probe")):
+        pm = int(
+            state.get("react_probe_max_steps")
+            or getattr(settings, "REACT_LOW_SIGNAL_PROBE_MAX_STEPS", 1)
+            or 1
+        )
+        max_steps = max(1, min(pm, hard_cap))
+
+    q = state.get("current_step") or state.get("query") or ""
+
     shell_ok = intent_s == "structured"
+    ask_shell_min = float(
+        getattr(settings, "REACT_ASK_MODE_SHELL_MIN_CONFIDENCE", 0.55) or 0.55
+    )
+    if (
+        not shell_ok
+        and str(state.get("mode") or "").lower() == "ask"
+        and intent_s != "broad"
+        and cls_loop >= ask_shell_min
+        and looks_like_task_execution_query(str(q))
+    ):
+        shell_ok = True
     if bool(state.get("long_run_mode")):
         shell_ok = shell_ok and bool(
             getattr(settings, "LONG_RUN_SHELL_ENABLED", False)
         )
-
-    q = state.get("current_step") or state.get("query") or ""
     router = state.get("selected_tool")
     rconf = float(state.get("router_confidence") or 0.0)
     state["react_goal"] = extract_goal(q)
@@ -692,6 +735,14 @@ async def run_reasoning_loop(
             file_scores[p] = max(file_scores[p], float(v))
         except (TypeError, ValueError):
             pass
+
+    decay = float(getattr(settings, "REACT_FILE_SCORE_DECAY", 0.97) or 0.97)
+    if 0 < decay < 1 and file_scores:
+        for fk in list(file_scores.keys()):
+            try:
+                file_scores[fk] *= decay
+            except (TypeError, ValueError):
+                pass
 
     carry_tr = list(state.get("carryover_tool_results") or [])
     state.pop("carryover_tool_results", None)
