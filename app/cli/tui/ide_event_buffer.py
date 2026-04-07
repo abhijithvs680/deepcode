@@ -1,0 +1,91 @@
+"""Coalesce high-frequency EventBus events before IDE repaint (~100ms batch)."""
+from __future__ import annotations
+
+from typing import Any, Callable
+
+
+def normalize_paths(paths: list[str], cap: int) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for p in paths:
+        n = str(p or "").replace("\\", "/").strip()
+        if not n or n in seen:
+            continue
+        seen.add(n)
+        out.append(n)
+        if len(out) >= cap:
+            break
+    return out
+
+
+def coalesce_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep last agent_status / state per batch; preserve order for others."""
+    out: list[dict[str, Any]] = []
+    pending_as: dict[str, Any] | None = None
+    pending_state: dict[str, Any] | None = None
+
+    def flush_pending() -> None:
+        nonlocal pending_as, pending_state
+        if pending_as is not None:
+            out.append(pending_as)
+            pending_as = None
+        if pending_state is not None:
+            out.append(pending_state)
+            pending_state = None
+
+    for ev in events:
+        t = ev.get("type")
+        if t == "agent_status":
+            pending_as = ev
+            continue
+        if t == "state":
+            pending_state = ev
+            continue
+        flush_pending()
+        out.append(ev)
+    flush_pending()
+    return out
+
+
+class IdeEventDebouncer:
+    """Single timer; drains queue; reschedules if new events arrived during flush."""
+
+    def __init__(
+        self,
+        *,
+        interval_s: float = 0.1,
+        on_flush: Callable[[list[dict[str, Any]]], None],
+    ) -> None:
+        self.interval_s = interval_s
+        self.on_flush = on_flush
+        self._queue: list[dict[str, Any]] = []
+        self._scheduled = False
+        self._app: Any = None
+
+    def bind_app(self, app: Any) -> None:
+        self._app = app
+
+    def push(self, event: dict[str, Any]) -> None:
+        self._queue.append(event)
+        if self._app is None or self._scheduled:
+            return
+        self._scheduled = True
+        self._app.set_timer(self.interval_s, self._flush)
+
+    def _flush(self) -> None:
+        self._scheduled = False
+        batch = self._queue
+        self._queue = []
+        if batch:
+            self.on_flush(coalesce_events(batch))
+        if self._queue and self._app is not None:
+            self._scheduled = True
+            self._app.set_timer(self.interval_s, self._flush)
+
+    def flush_now(self) -> None:
+        """Drain pending events synchronously (e.g. before unsubscribing)."""
+        self._scheduled = False
+        batch = self._queue
+        self._queue = []
+        if batch:
+            self.on_flush(coalesce_events(batch))

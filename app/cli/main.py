@@ -80,7 +80,12 @@ repos_app = typer.Typer(help="Manage registered repositories")
 app.add_typer(repos_app, name="repos")
 
 
-def _launch_ui(repo: Optional[str]) -> None:
+def _launch_ui(repo: Optional[str], *, ide: bool = False) -> None:
+    if ide:
+        from app.cli.tui.ide_app import run_ide_tui
+
+        run_ide_tui(raw_repo_input=repo)
+        return
     from app.cli.tui.app import run_tui
 
     # Direct transfer avoiding asyncio termination destructing ingestion queries
@@ -101,7 +106,7 @@ def main(
         typer.echo(f"DeepCode v{v}")
         raise typer.Exit()
     if ctx.invoked_subcommand is None:
-        _launch_ui(None)
+        _launch_ui(None, ide=False)
 
 
 @app.command("ui")
@@ -110,9 +115,14 @@ def ui_cli(
         None,
         help="Local directory, or git URL (default: current working directory)",
     ),
+    ide: bool = typer.Option(
+        False,
+        "--ide",
+        help="Agent IDE layout (chat · editor/diff · explorer + event terminal).",
+    ),
 ) -> None:
     """Interactive TUI: resolve repo, ensure index, then chat."""
-    _launch_ui(repo)
+    _launch_ui(repo, ide=ide)
 
 @app.command("doctor")
 def cmd_doctor() -> None:

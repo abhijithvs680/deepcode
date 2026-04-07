@@ -768,6 +768,20 @@ class AgentOrchestrator:
                             strong_ctx = has_strong_merged_context(state)
                             enough = enough_context(state)
 
+                            state.setdefault("rag_decision_trace", [])
+                            rd = state["rag_decision_trace"]
+                            rd.append(
+                                {
+                                    "phase": "post_react",
+                                    "merged_react_conf": merged_react_conf,
+                                    "cls_conf": cls_conf,
+                                    "forced_rag": forced_rag,
+                                    "strong_ctx": strong_ctx,
+                                    "enough_context": enough,
+                                    "low_signal": low_signal,
+                                }
+                            )
+
                             async def _run_rag(reason: str) -> None:
                                 nonlocal state
                                 state["rag_used"] = True
@@ -803,6 +817,12 @@ class AgentOrchestrator:
                                 state["rag_reason"] = (
                                     "git_or_forced_tool_high_confidence_skip_rag"
                                 )
+                                rd.append(
+                                    {
+                                        "branch": "skip_rag",
+                                        "detail": state["rag_reason"],
+                                    }
+                                )
                                 fl = list(state.get("fallbacks_local") or [])
                                 if "rag_skipped_git_bypass" not in fl:
                                     fl.append("rag_skipped_git_bypass")
@@ -811,16 +831,55 @@ class AgentOrchestrator:
                                 state.setdefault("ranked_ctx", [])
                                 state["rag_used"] = False
                                 state["rag_reason"] = "strong_merged_context_skip_rag"
+                                rd.append(
+                                    {
+                                        "branch": "skip_rag",
+                                        "detail": state["rag_reason"],
+                                    }
+                                )
                             elif enough:
                                 state.setdefault("ranked_ctx", [])
                                 state["rag_used"] = False
                                 state["rag_reason"] = "enough_context_after_react"
+                                rd.append(
+                                    {
+                                        "branch": "skip_rag",
+                                        "detail": state["rag_reason"],
+                                    }
+                                )
                             elif forced_rag and not strong_ctx:
+                                rd.append(
+                                    {
+                                        "branch": "run_rag",
+                                        "detail": "no_progress_after_react_tools",
+                                    }
+                                )
                                 await _run_rag("no_progress_after_react_tools")
                             elif low_signal:
+                                rd.append(
+                                    {
+                                        "branch": "run_rag",
+                                        "detail": "low_confidence_boost_rag",
+                                    }
+                                )
                                 await _run_rag("low_confidence_boost_rag")
                             else:
+                                rd.append(
+                                    {
+                                        "branch": "run_rag",
+                                        "detail": "insufficient_grounding_after_react",
+                                    }
+                                )
                                 await _run_rag("insufficient_grounding_after_react")
+
+                            await EventBus.emit(
+                                {
+                                    "type": "rag_triggered",
+                                    "reason": str(state.get("rag_reason") or ""),
+                                    "rag_used": bool(state.get("rag_used")),
+                                    "trace": list(rd[-12:]),
+                                }
+                            )
 
                             if trace:
                                 trace.react_tool_steps_count = len(
@@ -916,10 +975,15 @@ class AgentOrchestrator:
                                 )
                                 or 1.0
                             )
-                            post_answer_conf = compute_answer_confidence(state)
-                            force_confirm = (
-                                post_answer_conf < 0.6 or cls_c < 0.6
+                            post_answer_conf = float(
+                                compute_answer_confidence(state)
                             )
+                            force_confirm = (
+                                post_answer_conf < 0.6
+                                or cls_c < 0.6
+                                or bool(state.get("require_user_confirm"))
+                            )
+                            state["require_user_confirm"] = bool(force_confirm)
                             state["require_edit_confirmation"] = force_confirm
 
                             confirm_cb = (
@@ -1473,6 +1537,27 @@ class AgentOrchestrator:
                         or []
                     ),
                     "cross_subgoal_meta": state.get("cross_subgoal_meta") or {},
+                    "early_stop_reason": state.get("react_early_stop_reason")
+                    or "",
+                    "react_early_stop_reason": state.get("react_early_stop_reason")
+                    or "",
+                    "rag_decision_trace": list(state.get("rag_decision_trace") or []),
+                    "require_user_confirm": float(
+                        compute_answer_confidence(state)
+                    )
+                    < 0.6
+                    or bool(state.get("require_user_confirm")),
+                    "active_working_set": list(
+                        state.get("active_working_set") or []
+                    ),
+                    "shared_context": state.get("shared_context") or {},
+                    "global_insights": list(
+                        (state.get("global_insights") or [])[:24]
+                    ),
+                    "subgoal_traces": state.get("subgoal_traces") or [],
+                    "cross_subgoal_summary": state.get("cross_subgoal_summary")
+                    or "",
+                    "file_scores": state.get("file_scores") or {},
                 },
             }
             if trace:
@@ -1482,7 +1567,17 @@ class AgentOrchestrator:
             from app.logging.telemetry import telemetry_tracker
             state["model"] = self.settings.LLM_MODEL
             telemetry_tracker.export_metrics(session_id, state)
-            
+
+            from app.core.event_bus import EventBus
+
+            await EventBus.emit(
+                {
+                    "type": "final_answer",
+                    "content": state.get("answer") or "",
+                    "session_id": session_id,
+                }
+            )
+
             return return_dict
 
         except Exception as exc:

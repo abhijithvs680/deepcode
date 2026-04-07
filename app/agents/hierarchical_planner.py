@@ -517,6 +517,11 @@ def merge_react_subgoal_results(
     parent_state["active_working_set"] = build_active_working_set(
         subgoal_runs, query=q_ws
     )
+    if subgoal_runs:
+        _last_sub = subgoal_runs[-1][1]
+        r = str(_last_sub.get("react_early_stop_reason") or "").strip()
+        if r:
+            parent_state["react_early_stop_reason"] = r
     return parent_state, subgoal_traces
 
 

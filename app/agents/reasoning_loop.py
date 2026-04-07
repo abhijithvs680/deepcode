@@ -59,6 +59,19 @@ def _maybe_force_rag_escape(state: dict[str, Any]) -> None:
     state["react_force_rag"] = True
 
 
+async def _maybe_force_rag_escape_emit(state: dict[str, Any]) -> None:
+    before = bool(state.get("react_force_rag"))
+    _maybe_force_rag_escape(state)
+    if bool(state.get("react_force_rag")) and not before:
+        await EventBus.emit(
+            {
+                "type": "rag_escalation",
+                "reason": "no_progress_after_tools",
+                "subgoal_id": state.get("subgoal_id"),
+            }
+        )
+
+
 def valid_observations(obs: list[Any]) -> list[str]:
     """Drop empty / noise strings so prompts are not padded with junk."""
     out: list[str] = []
@@ -642,12 +655,14 @@ async def run_reasoning_loop(
         sess_ev["subgoal_description"] = (state.get("subgoal_description") or "")[:200]
     await _emit_react(state, sess_ev)
 
+    state["react_early_stop_reason"] = ""
     last_loop_i = -1
     for i in range(max_steps):
         last_loop_i = i
         cancel_ev = state.get("react_cancel_event")
         if cancel_ev is not None and getattr(cancel_ev, "is_set", lambda: False)():
             logger.info("ReasoningLoop: cancel requested at step %s", i)
+            state["react_early_stop_reason"] = "user_cancelled"
             await _emit_react(state, {"type": "react_cancelled", "step": i})
             break
 
@@ -728,6 +743,7 @@ async def run_reasoning_loop(
             )
         except Exception as exc:
             logger.warning("ReasoningLoop LLM step failed: %s", exc)
+            state["react_early_stop_reason"] = "llm_error"
             await _emit_react(
                 state,
                 {"type": "react_llm_error", "step": i, "error": str(exc)[:200]},
@@ -754,6 +770,7 @@ async def run_reasoning_loop(
 
         if step.get("done") or step.get("action") == "done" or not step.get("tool"):
             logger.info("ReasoningLoop: planner signaled done at step %s", i)
+            state["react_early_stop_reason"] = "planner_done"
             await _emit_react(
                 state,
                 {"type": "react_done", "step": i, "thought": step.get("thought")},
@@ -793,7 +810,8 @@ async def run_reasoning_loop(
                 duration_ms=0,
             )
             if state["react_failed_steps"] >= 2:
-                _maybe_force_rag_escape(state)
+                await _maybe_force_rag_escape_emit(state)
+                state["react_early_stop_reason"] = "failed_steps_limit"
                 break
             continue
 
@@ -817,7 +835,8 @@ async def run_reasoning_loop(
                     duration_ms=0,
                 )
                 if state["react_failed_steps"] >= 2:
-                    _maybe_force_rag_escape(state)
+                    await _maybe_force_rag_escape_emit(state)
+                    state["react_early_stop_reason"] = "failed_steps_limit"
                     break
                 continue
             if not args.get("dry_run"):
@@ -853,7 +872,8 @@ async def run_reasoning_loop(
                             duration_ms=0,
                         )
                         if state["react_failed_steps"] >= 2:
-                            _maybe_force_rag_escape(state)
+                            await _maybe_force_rag_escape_emit(state)
+                            state["react_early_stop_reason"] = "edit_budget"
                             break
                         continue
                 if max_l > 0:
@@ -881,7 +901,8 @@ async def run_reasoning_loop(
                             duration_ms=0,
                         )
                         if state["react_failed_steps"] >= 2:
-                            _maybe_force_rag_escape(state)
+                            await _maybe_force_rag_escape_emit(state)
+                            state["react_early_stop_reason"] = "edit_budget"
                             break
                         continue
 
@@ -902,7 +923,8 @@ async def run_reasoning_loop(
                 duration_ms=0,
             )
             if state["react_failed_steps"] >= 2:
-                _maybe_force_rag_escape(state)
+                await _maybe_force_rag_escape_emit(state)
+                state["react_early_stop_reason"] = "repetition_limit"
                 break
             continue
         action_counts[action] += 1
@@ -926,7 +948,8 @@ async def run_reasoning_loop(
                 duration_ms=int((time.perf_counter() - t0) * 1000),
             )
             if state["react_failed_steps"] >= 2:
-                _maybe_force_rag_escape(state)
+                await _maybe_force_rag_escape_emit(state)
+                state["react_early_stop_reason"] = "tool_error_limit"
                 logger.info(
                     "ReasoningLoop: stopping after %s failed steps",
                     state["react_failed_steps"],
@@ -1023,6 +1046,20 @@ async def run_reasoning_loop(
                 if sym and sym not in state["symbols_found"]:
                     state["symbols_found"].append(sym)
 
+        _ac = compute_answer_confidence(state)
+        _nfr = len(state.get("files_read") or [])
+        _nsy = len(state.get("symbols_found") or [])
+        await EventBus.emit(
+            {
+                "type": "agent_status",
+                "confidence": _ac,
+                "files_read": _nfr,
+                "symbols": _nsy,
+                "weak_grounding": _nfr < 2 and _nsy == 0 and _ac < 0.5,
+                "subgoal_id": state.get("subgoal_id"),
+            }
+        )
+
         if (
             res
             and res.success
@@ -1074,6 +1111,7 @@ async def run_reasoning_loop(
                 "ReasoningLoop: high merged confidence — ending exploration at step %s",
                 i,
             )
+            state["react_early_stop_reason"] = "high_confidence"
             await _emit_react(
                 state,
                 {"type": "react_high_confidence_stop", "step": i},
@@ -1081,7 +1119,8 @@ async def run_reasoning_loop(
             break
 
         if state["react_failed_steps"] >= 2:
-            _maybe_force_rag_escape(state)
+            await _maybe_force_rag_escape_emit(state)
+            state["react_early_stop_reason"] = "failed_steps_limit"
             logger.info(
                 "ReasoningLoop: stopping after %s low-value/failed steps",
                 state["react_failed_steps"],
@@ -1098,19 +1137,33 @@ async def run_reasoning_loop(
                 and cls_esc < 0.4
             ):
                 state["react_force_rag"] = True
+                state["react_early_stop_reason"] = "no_progress_rag_escalation"
+                await EventBus.emit(
+                    {
+                        "type": "rag_escalation",
+                        "reason": "no_useful_steps_low_classification",
+                        "subgoal_id": state.get("subgoal_id"),
+                    }
+                )
                 logger.info(
                     "ReasoningLoop: no useful grounding through step %s → force RAG",
                     i,
                 )
+            else:
+                state["react_early_stop_reason"] = "no_useful_steps_stall"
             break
 
         if enough_context(state):
             logger.info("ReasoningLoop: enough_context met at step %s", i)
+            state["react_early_stop_reason"] = "enough_context"
             await _emit_react(
                 state,
                 {"type": "react_enough_context", "step": i},
             )
             break
+
+    if not (state.get("react_early_stop_reason") or "").strip():
+        state["react_early_stop_reason"] = "max_steps_exhausted"
 
     final_i = max(last_loop_i, 0)
     for p in list(file_scores.keys()):
@@ -1132,6 +1185,7 @@ async def run_reasoning_loop(
             "useful_steps": state["react_useful_steps"],
             "failed_steps": state["react_failed_steps"],
             "force_rag": bool(state.get("react_force_rag")),
+            "early_stop_reason": state.get("react_early_stop_reason") or "",
         },
     )
     return state

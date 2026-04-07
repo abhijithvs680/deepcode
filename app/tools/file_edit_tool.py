@@ -13,6 +13,7 @@ from difflib import unified_diff
 from typing import Any
 
 from app.core.config import get_settings
+from app.core.event_bus import EventBus
 from app.tools.base_tool import Tool, ToolResult
 
 logger = logging.getLogger(__name__)
@@ -79,6 +80,21 @@ class FileEditTool(Tool):
                 )
             )
         return "".join(chunks)
+
+    def session_diff_for_file(self, rel: str) -> str:
+        rel = rel.replace("\\", "/")
+        old = self._original.get(rel, "")
+        new = self._working.get(rel, "")
+        if old == new:
+            return ""
+        return "".join(
+            unified_diff(
+                old.splitlines(keepends=True),
+                new.splitlines(keepends=True),
+                fromfile=f"a/{rel}",
+                tofile=f"b/{rel}",
+            )
+        )
 
     def begin_session(self) -> None:
         self._original.clear()
@@ -357,16 +373,44 @@ class FileEditTool(Tool):
         if action == "rollback_to_last_checkpoint":
             return self.rollback_to_last_checkpoint()
         if action == "apply_search_replace":
-            return self.apply_search_replace(
+            r = self.apply_search_replace(
                 kwargs.get("file_path", kwargs.get("path", "")),
                 kwargs.get("search", ""),
                 kwargs.get("replace", ""),
                 expected_occurrences=int(kwargs.get("expected_occurrences", 1)),
                 dry_run=bool(kwargs.get("dry_run")),
             )
+            if r.success and r.data:
+                rel = str((r.data or {}).get("file") or "").replace("\\", "/")
+                if rel:
+                    diff_txt = str((r.data or {}).get("diff_preview") or "")
+                    if not diff_txt and not bool(kwargs.get("dry_run")):
+                        diff_txt = self.session_diff_for_file(rel)
+                    if diff_txt:
+                        await EventBus.emit(
+                            {
+                                "type": "diff_ready",
+                                "file": rel,
+                                "diff": diff_txt[:16000],
+                                "workspace": self.repo_path,
+                                "dry_run": bool(kwargs.get("dry_run")),
+                            }
+                        )
+            return r
         if action == "commit_session":
             af = kwargs.get("allowed_files") or []
-            return self.commit_session({str(x).replace("\\", "/") for x in af})
+            r = self.commit_session({str(x).replace("\\", "/") for x in af})
+            if r.success and r.data and not (r.data or {}).get("dry_run"):
+                for fp in (r.data or {}).get("files_written") or []:
+                    p = str(fp).replace("\\", "/")
+                    await EventBus.emit(
+                        {
+                            "type": "file_updated",
+                            "file": p,
+                            "workspace": self.repo_path,
+                        }
+                    )
+            return r
         if action == "rollback_session":
             return self.rollback_session()
         if action == "configure":
