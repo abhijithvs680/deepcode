@@ -207,6 +207,9 @@ class IDEState:
                 "symbols": int(event.get("symbols") or 0),
                 "weak_grounding": bool(event.get("weak_grounding")),
                 "subgoal_id": event.get("subgoal_id"),
+                "agent_execution_phase": str(
+                    event.get("agent_execution_phase") or "explore"
+                ),
             }
             self.confidence = float(event.get("confidence") or 0)
         elif t == "subgoal_start":
@@ -465,21 +468,45 @@ class IDEState:
             lines.append("[dim]" + "  ·  ".join(tail[-5:]) + "[/dim]")
         return "\n".join(lines)
 
+    def _composer_agent_mode_label(self) -> str:
+        if self.ui_phase == "awaiting_confirm":
+            return "Awaiting confirm"
+        if self.ui_phase == "awaiting_shell":
+            return "Shell confirm"
+        if self.ui_phase == "running":
+            ph = str(
+                (self.agent_status or {}).get("agent_execution_phase") or "explore"
+            ).lower()
+            if ph == "execute":
+                return "Execute"
+            return "Explore"
+        return "Ready"
+
     def composer_chrome_hint(self) -> str:
         """Bottom composer row (Cursor-style): mode line + shortcuts."""
+        mode = self._composer_agent_mode_label()
         if self.ui_phase == "awaiting_confirm":
             return (
                 "[yellow]⚠ Awaiting confirmation[/yellow]  "
-                "[dim]Enter send · Shift+Enter newline · Ctrl+P palette[/dim]"
+                f"[dim]Agent · {rich_escape(mode)}  ·  "
+                "Enter send · Shift+Enter newline · Ctrl+P palette[/dim]"
+            )
+        if self.ui_phase == "awaiting_shell":
+            return (
+                "[yellow]⚠ Shell approval[/yellow]  "
+                f"[dim]Agent · {rich_escape(mode)}  ·  "
+                "Enter send · Shift+Enter newline · Ctrl+P[/dim]"
             )
         if self.ui_phase == "running":
             return (
                 "[cyan]● Running…[/cyan]  "
-                "[dim]Agent · Auto  ·  Enter send · Shift+Enter newline · Ctrl+P[/dim]"
+                f"[dim]Agent · {rich_escape(mode)}  ·  "
+                "Enter send · Shift+Enter newline · Ctrl+P[/dim]"
             )
         return (
             "[green]✓ Ready[/green]  "
-            "[dim]Agent · Auto  ·  Enter send · Shift+Enter newline · Ctrl+P[/dim]"
+            f"[dim]Agent · {rich_escape(mode)}  ·  "
+            "Enter send · Shift+Enter newline · Ctrl+P[/dim]"
         )
 
     def status_bar_text(self) -> str:

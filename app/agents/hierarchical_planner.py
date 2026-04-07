@@ -539,6 +539,53 @@ def merge_react_subgoal_results(
     return parent_state, subgoal_traces
 
 
+def _symbol_related_paths_from_tool_results(
+    subgoal_runs: list[tuple[Subgoal, dict[str, Any]]],
+) -> set[str]:
+    """Paths tied to symbol tools (definitions / dependency bundles), not filename substring guesses."""
+    out: set[str] = set()
+    for _sg, st in subgoal_runs:
+        for tr in st.get("tool_results") or []:
+            if not isinstance(tr, dict) or not tr.get("success"):
+                continue
+            act = tr.get("action")
+            data = tr.get("data") or {}
+            if not isinstance(data, dict):
+                continue
+            if act == "find_symbol":
+                for m in data.get("matches") or []:
+                    if isinstance(m, dict):
+                        fp = m.get("file")
+                        if isinstance(fp, str) and fp.strip():
+                            out.add(fp.replace("\\", "/"))
+            elif act == "get_symbol_dependencies":
+                pf = data.get("primary_file")
+                if isinstance(pf, str) and pf.strip():
+                    out.add(pf.replace("\\", "/"))
+                for m in data.get("matches") or []:
+                    if isinstance(m, dict):
+                        fp = m.get("file")
+                        if isinstance(fp, str) and fp.strip():
+                            out.add(fp.replace("\\", "/"))
+                g = data.get("graph") or {}
+                if isinstance(g, dict):
+                    for p in g:
+                        if isinstance(p, str) and p.strip():
+                            out.add(p.replace("\\", "/"))
+                    for bundle in g.values():
+                        if not isinstance(bundle, dict):
+                            continue
+                        for k in ("imports", "imported_by"):
+                            for p in bundle.get(k) or []:
+                                if isinstance(p, str) and p.strip():
+                                    out.add(p.replace("\\", "/"))
+    return out
+
+
+def _norm_ws_path_key(p: str) -> str:
+    return str(p).replace("\\", "/").strip().lstrip("./").lower()
+
+
 def build_active_working_set(
     subgoal_runs: list[tuple[Subgoal, dict[str, Any]]],
     *,
@@ -595,7 +642,10 @@ def build_active_working_set(
         for s in merged_symbols_so_far(subgoal_runs)
         if isinstance(s, str) and len(str(s).strip()) > 1
     ]
-    if qtxt or sym_tokens:
+    sym_path_keys = {
+        _norm_ws_path_key(x) for x in _symbol_related_paths_from_tool_results(subgoal_runs)
+    }
+    if qtxt or sym_tokens or sym_path_keys:
         scored: list[tuple[float, int, str]] = []
         for idx, p in enumerate(out):
             base = p.split("/")[-1] if p else ""
@@ -603,12 +653,14 @@ def build_active_working_set(
                 keyword_relevance(qtxt, p, base.replace("_", " ")) if qtxt else 0.0
             )
             sym_boost = 0.0
+            if _norm_ws_path_key(p) in sym_path_keys:
+                sym_boost = max(sym_boost, 2.5)
             pl = p.lower()
             for sym in sym_tokens:
                 if len(sym) < 3:
                     continue
                 if sym in pl or sym.replace("_", "") in pl.replace("_", ""):
-                    sym_boost = 2.0
+                    sym_boost = max(sym_boost, 2.0)
                     break
             scored.append((rel + sym_boost, idx, p))
         scored.sort(key=lambda t: (-t[0], t[1]))

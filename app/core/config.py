@@ -107,6 +107,13 @@ class Settings(BaseSettings):
     # When True, ask mode delays shell + mutating file_edit until after a useful read/search/deps step
     # (skipped for edit mode, write_enabled, structured intent, long_run, or explicit task-shell queries).
     REACT_EXPLORATION_FIRST: bool = True
+    # Unlock shell/edit gating after enough grounding evidence (OR semantics across the four thresholds).
+    REACT_EXEC_UNLOCK_MIN_FILES_READ: int = 2
+    REACT_EXEC_UNLOCK_MIN_SYMBOLS: int = 2
+    REACT_EXEC_UNLOCK_MIN_CONFIDENCE: float = 0.5
+    REACT_EXEC_UNLOCK_MIN_GOAL_PROGRESS: float = 0.35
+    # Re-run the same shell invocation once on hard failure (not skip / no-UI / timeout).
+    REACT_SHELL_FAILURE_RETRY_ONCE: bool = True
 
     # ReAct-style tool-first exploration (RAG only when context is insufficient)
     REACT_AGENT_ENABLED: bool = True

@@ -15,7 +15,10 @@ import asyncio
 
 if sys.platform == "win32":
     try:
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        # SelectorEventLoop does not implement subprocess transports on Windows
+        # (NotImplementedError in asyncio.create_subprocess_*). Agent shell + IDE
+        # terminal panel require ProactorEventLoop.
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
     except Exception:
         pass
 

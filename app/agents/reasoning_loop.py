@@ -159,6 +159,30 @@ def _norm_rel_path(p: str) -> str:
     return str(p).replace("\\", "/")
 
 
+def _react_evidence_unlocks_execution(state: dict[str, Any], settings: Any) -> bool:
+    """Require grounding evidence before shell / mutating edits when exploration-first is on."""
+    thr_f = int(getattr(settings, "REACT_EXEC_UNLOCK_MIN_FILES_READ", 2) or 2)
+    thr_s = int(getattr(settings, "REACT_EXEC_UNLOCK_MIN_SYMBOLS", 2) or 2)
+    conf_thr = float(
+        getattr(settings, "REACT_EXEC_UNLOCK_MIN_CONFIDENCE", 0.5) or 0.5
+    )
+    gp_thr = float(
+        getattr(settings, "REACT_EXEC_UNLOCK_MIN_GOAL_PROGRESS", 0.35) or 0.35
+    )
+    thr_f = max(1, thr_f)
+    thr_s = max(1, thr_s)
+    nfr = len(state.get("files_read") or [])
+    nsy = len(state.get("symbols_found") or [])
+    ac = compute_answer_confidence(state)
+    gp = float(state.get("goal_progress") or 0)
+    return (
+        nfr >= thr_f
+        or nsy >= thr_s
+        or ac >= conf_thr
+        or gp >= gp_thr
+    )
+
+
 _REL_OK = 0.22
 
 
@@ -740,6 +764,7 @@ async def run_reasoning_loop(
     state["react_failed_steps"] = 0
     state["react_edit_line_estimate"] = 0
     state["react_force_rag"] = intent_s == "broad"
+    state["_probe_search_paths"] = []
     state["file_scores"] = dict(state.get("file_scores") or {})
     file_scores: dict[str, float] = defaultdict(float)
     last_touch_step: dict[str, int] = {}
@@ -917,6 +942,25 @@ async def run_reasoning_loop(
         step.setdefault("action", "done")
         step.setdefault("args", {})
         step.setdefault("done", False)
+
+        if bool(state.get("react_low_signal_repo_probe")):
+            if i == 0:
+                step["tool"] = "file"
+                step["action"] = "search"
+                step["args"] = {
+                    "query": (str(q or "").strip()[:120] or "main entry")
+                }
+                step["done"] = False
+            elif i == 1:
+                candidates = list(state.get("_probe_search_paths") or [])
+                step["tool"] = "file"
+                step["done"] = False
+                if candidates:
+                    step["action"] = "read_file"
+                    step["args"] = {"path": candidates[0]}
+                else:
+                    step["action"] = "list_dir"
+                    step["args"] = {"path": ".", "depth": 2}
 
         state["react_steps"].append(
             {
@@ -1173,6 +1217,33 @@ async def run_reasoning_loop(
                 break
             continue
 
+        if (
+            tool_name == "shell"
+            and res is not None
+            and not res.success
+            and bool(getattr(settings, "REACT_SHELL_FAILURE_RETRY_ONCE", True))
+        ):
+            d0 = res.data if isinstance(res.data, dict) else {}
+            err_s = str(res.error or "").lower()
+            skip_like = bool(d0.get("skipped")) or "user skipped" in err_s
+            no_cb = (
+                "interactive session" in err_s
+                or "no confirm_shell_callback" in err_s
+            )
+            timed = "timed out" in err_s or "timeout" in err_s
+            if not skip_like and not no_cb and not timed:
+                state["react_observations"].append(
+                    f"Step {i}: shell failed — retrying once ({(res.error or '')[:80]})"
+                )
+                try:
+                    res = await registry.execute_tool(
+                        tool_name, action, **exec_args
+                    )
+                except Exception as exc:
+                    state["react_observations"].append(
+                        f"Step {i}: shell retry error {exc}"
+                    )
+
         useful = _tool_step_useful(res, q)
         if res and res.success and tool_name == "file_edit":
             if action in (
@@ -1187,14 +1258,22 @@ async def run_reasoning_loop(
             state["react_failed_steps"] += 1
 
         if (
-            explore_first
-            and useful
-            and res
+            res
             and res.success
-            and tool_name in ("file", "git", "log")
-            and action != "run_command"
+            and tool_name == "file"
+            and action == "search"
         ):
-            state["react_execution_allowed"] = True
+            data_s = res.data or {}
+            probe_paths: list[str] = []
+            if isinstance(data_s, dict):
+                for m in data_s.get("matches") or []:
+                    if not isinstance(m, dict):
+                        continue
+                    fp = m.get("file") or m.get("path")
+                    if isinstance(fp, str) and fp.strip():
+                        probe_paths.append(fp.replace("\\", "/"))
+            if probe_paths:
+                state["_probe_search_paths"] = probe_paths[:16]
 
         dumped = res.model_dump() if res is not None else {}
         state["tool_results"].append(dumped)
@@ -1280,6 +1359,10 @@ async def run_reasoning_loop(
                 if sym and sym not in state["symbols_found"]:
                     state["symbols_found"].append(sym)
 
+        if explore_first and not state.get("react_execution_allowed"):
+            if _react_evidence_unlocks_execution(state, settings):
+                state["react_execution_allowed"] = True
+
         _ac = compute_answer_confidence(state)
         _nfr = len(state.get("files_read") or [])
         _nsy = len(state.get("symbols_found") or [])
@@ -1291,6 +1374,9 @@ async def run_reasoning_loop(
                 "symbols": _nsy,
                 "weak_grounding": _nfr < 2 and _nsy == 0 and _ac < 0.5,
                 "subgoal_id": state.get("subgoal_id"),
+                "agent_execution_phase": (
+                    "execute" if state.get("react_execution_allowed") else "explore"
+                ),
             }
         )
 

@@ -42,25 +42,33 @@ class IdeSubprocessShell:
         async with self._lock:
             if self.running:
                 return
-            if sys.platform == "win32":
-                self._proc = await asyncio.create_subprocess_exec(
-                    "cmd.exe",
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT,
-                    cwd=self._cwd,
-                    env=os.environ.copy(),
+            try:
+                if sys.platform == "win32":
+                    self._proc = await asyncio.create_subprocess_exec(
+                        "cmd.exe",
+                        stdin=asyncio.subprocess.PIPE,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.STDOUT,
+                        cwd=self._cwd,
+                        env=os.environ.copy(),
+                    )
+                else:
+                    self._proc = await asyncio.create_subprocess_exec(
+                        "/bin/bash",
+                        "--noprofile",
+                        stdin=asyncio.subprocess.PIPE,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.STDOUT,
+                        cwd=self._cwd,
+                        env=os.environ.copy(),
+                    )
+            except NotImplementedError:
+                self._on_line(
+                    "[shell] This Python event loop cannot spawn subprocesses on Windows. "
+                    "Use the CLI entrypoint (deepcode / python -m app.cli.main) so "
+                    "WindowsProactorEventLoopPolicy is set, or run commands outside the IDE."
                 )
-            else:
-                self._proc = await asyncio.create_subprocess_exec(
-                    "/bin/bash",
-                    "--noprofile",
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT,
-                    cwd=self._cwd,
-                    env=os.environ.copy(),
-                )
+                return
             self._reader_task = asyncio.create_task(self._read_stdout())
 
     async def _read_stdout(self) -> None:

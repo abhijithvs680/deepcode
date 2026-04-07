@@ -211,13 +211,23 @@ class ShellTool(Tool):
     async def _run_subprocess(
         self, command: str, cwd: str, timeout_s: float
     ) -> tuple[int, str, str]:
-        proc = await asyncio.create_subprocess_shell(
-            command,
-            cwd=cwd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            limit=_MAX_CAPTURE_CHARS + 64_000,
-        )
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                command,
+                cwd=cwd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                limit=_MAX_CAPTURE_CHARS + 64_000,
+            )
+        except NotImplementedError:
+            logger.error(
+                "shell_tool: event loop cannot spawn subprocesses (Windows needs "
+                "ProactorEventLoop — use app.cli.main entrypoint)"
+            )
+            return -1, "", (
+                "Subprocesses are not supported by this asyncio event loop on Windows. "
+                "Restart via `deepcode` / `python -m app.cli.main` (Proactor policy)."
+            )
         try:
             raw_out, raw_err = await asyncio.wait_for(
                 proc.communicate(), timeout=timeout_s
