@@ -3,6 +3,7 @@ Full ingest: chunks + embeddings + repo intel (single entry for CLI and repo_man
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 from app.core.config import get_settings
@@ -28,6 +29,7 @@ async def ingest_repository(
     overlap: int = 50,
     max_source_files: int | None = None,
     dispose_after: bool = False,
+    status_callback: Callable[[str], None] | None = None,
 ) -> int:
     """
     Embed chunks and write intel rows under ``repo_name``.
@@ -41,8 +43,13 @@ async def ingest_repository(
     await create_tables()
 
     if clear:
+        if status_callback:
+            status_callback("Clearing previous index for this repository…")
         deleted = await clear_repo(repo_name)
         logger.info("Cleared %s prior rows for '%s'", deleted, repo_name)
+
+    if status_callback:
+        status_callback(f"Scanning & chunking files under {root.name}…")
 
     chunks = process_repo(
         str(root),
@@ -53,12 +60,22 @@ async def ingest_repository(
     )
 
     if not chunks:
+        if status_callback:
+            status_callback("No chunks produced (empty or filtered tree).")
         return 0
 
+    if status_callback:
+        status_callback(f"Built {len(chunks)} text chunks — starting embeddings…")
+
     provider = get_provider()
-    inserted = await insert_chunks(chunks, provider)
+    inserted = await insert_chunks(
+        chunks, provider, status_callback=status_callback
+    )
 
     st = get_settings()
+    if status_callback:
+        status_callback("Extracting symbols, imports, and git metadata…")
+
     files = load_repo(str(root), max_files=max_source_files)
     sym_rows, meta_rows, edge_rows = build_repo_intel_from_files(
         files, repo_name, st.CODE_INTEL_PACKAGE_ROOTS
@@ -68,6 +85,9 @@ async def ingest_repository(
         await replace_repo_intel(db, repo_name, sym_rows, edge_rows, meta_rows)
         await replace_repo_file_git(db, repo_name, git_rows)
         await db.commit()
+
+    if status_callback:
+        status_callback("Intel graphs and git rows saved.")
 
     if dispose_after:
         await dispose_engine()

@@ -124,8 +124,9 @@ async def execute_ingest(
             chunk_size=chunk_size,
             overlap=overlap,
             max_source_files=cap,
+            status_callback=echo,
         )
-        echo(f"   [Foreground] Ingest complete ({inserted} chunks).")
+        echo(f"   Ingest complete — {inserted} chunks indexed.")
         from app.core.repo_registry import update_repo_registry
         update_repo_registry(repo_id, repo_path, head_hash, index_version=1)
         INGEST_STATUS[repo_id] = {"status": "done", "finished_at": datetime.now(timezone.utc).isoformat()}

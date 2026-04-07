@@ -91,7 +91,7 @@ class OllamaProvider(LLMProvider):
             "think": self._think_flag(),
         }
 
-        logger.info("Ollama chat → model=%s think=%s", target_model, payload["think"])
+        logger.info("Ollama chat: model=%s think=%s", target_model, payload["think"])
 
         try:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
@@ -133,7 +133,7 @@ class OllamaProvider(LLMProvider):
         }
         if system_prompt:
             body["system"] = system_prompt
-        logger.info("Ollama generate (fallback) → model=%s", target_model)
+        logger.info("Ollama generate (fallback): model=%s", target_model)
         response = await client.post(url, json=body)
         response.raise_for_status()
         data = response.json()
@@ -150,7 +150,7 @@ class OllamaProvider(LLMProvider):
             "think": self._think_flag(),
         }
 
-        logger.info("Ollama chat stream → model=%s", target_model)
+        logger.info("Ollama chat stream: model=%s", target_model)
 
         try:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
@@ -191,28 +191,87 @@ class OllamaProvider(LLMProvider):
                 f"Ollama returned {exc.response.status_code}: {exc.response.text}"
             ) from exc
 
-    async def embed(self, text: str) -> list[float]:
-        """Generate an embedding vector using Ollama."""
-        url = f"{self.base_url}/api/embeddings"
-        payload = {
-            "model": self.embedding_model,
-            "prompt": text,
-        }
+    @staticmethod
+    def _parse_embedding_body(data: dict) -> list[float]:
+        """Normalize Ollama JSON (legacy + /api/embed) to a single vector."""
+        embs = data.get("embeddings")
+        if isinstance(embs, list) and embs:
+            first = embs[0]
+            if isinstance(first, list) and first and isinstance(first[0], (int, float)):
+                return [float(x) for x in first]
+        single = data.get("embedding")
+        if isinstance(single, list) and single and isinstance(single[0], (int, float)):
+            return [float(x) for x in single]
+        return []
 
-        logger.info("Ollama embed → model=%s", self.embedding_model)
+    async def embed(self, text: str) -> list[float]:
+        """
+        Embedding via Ollama. Prefer /api/embed (current API); fall back to /api/embeddings.
+        Many models (e.g. qwen3-embedding) 500 on deprecated /api/embeddings on newer Ollama.
+        """
+        raw = (text or "").replace("\x00", "")
+        if not raw.strip():
+            return []
+
+        # Avoid pathological payloads (embedding models still tokenize this)
+        max_chars = 120_000
+        if len(raw) > max_chars:
+            raw = raw[:max_chars]
+            logger.warning("Embedding input truncated to %d chars", max_chars)
+
+        model = self.embedding_model
+        dim = getattr(settings, "EMBEDDING_DIMENSION", None)
+        logger.info("Ollama embed: model=%s", model)
+
+        async def _post(client: httpx.AsyncClient, path: str, body: dict) -> httpx.Response:
+            return await client.post(f"{self.base_url}{path}", json=body)
 
         try:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
-                response = await client.post(url, json=payload)
-                response.raise_for_status()
-                data = response.json()
-                if "embedding" in data:
-                    return data["embedding"] or []
-                embs = data.get("embeddings")
-                if isinstance(embs, list) and embs:
-                    first = embs[0]
-                    if isinstance(first, list):
-                        return first
+                attempts: list[tuple[str, dict]] = []
+
+                # Modern endpoint + optional Matryoshka dimensions
+                base_embed: dict = {
+                    "model": model,
+                    "input": raw,
+                    "truncate": True,
+                }
+                if isinstance(dim, int) and dim > 0:
+                    attempts.append(
+                        ("/api/embed", {**base_embed, "dimensions": dim})
+                    )
+                attempts.append(("/api/embed", dict(base_embed)))
+
+                # Legacy
+                attempts.append(
+                    (
+                        "/api/embeddings",
+                        {"model": model, "prompt": raw},
+                    )
+                )
+
+                last_err = ""
+                for path, body in attempts:
+                    try:
+                        r = await _post(client, path, body)
+                        if r.status_code != 200:
+                            last_err = f"{path} {r.status_code}: {r.text[:400]}"
+                            logger.warning("Ollama embed %s", last_err)
+                            continue
+                        vec = self._parse_embedding_body(r.json())
+                        if vec:
+                            return vec
+                        last_err = f"{path} returned empty embedding"
+                        logger.warning("Ollama %s", last_err)
+                    except httpx.HTTPError as exc:
+                        last_err = str(exc)
+                        logger.warning("Ollama embed %s failed: %s", path, exc)
+
+                logger.error(
+                    "All Ollama embedding attempts failed for model=%s. Last: %s",
+                    model,
+                    last_err,
+                )
                 return []
         except httpx.ConnectError as exc:
             logger.error("Cannot reach Ollama at %s: %s", self.base_url, exc)

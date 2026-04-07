@@ -12,8 +12,9 @@ from rich.markup import escape
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import Footer, Header, Input, Static, Button, RichLog, LoadingIndicator
+
+from textual.containers import Container, Horizontal, Vertical, VerticalScroll
+from textual.widgets import Footer, Header, Input, Static, Button, RichLog
 from textual.screen import ModalScreen
 
 class ConfirmDiffScreen(ModalScreen[bool]):
@@ -47,42 +48,101 @@ from app.core.config import get_settings
 
 class IngestionLoaderScreen(ModalScreen):
     CSS = """
+    IngestionLoaderScreen {
+        align: center middle;
+    }
+    #ingest-backdrop {
+        width: 100%;
+        height: 100%;
+        align: center middle;
+        background: $background 70%;
+    }
     #ingestion-dialog {
+        width: 72;
+        max-width: 92%;
+        height: auto;
+        max-height: 88%;
         background: $surface;
         border: thick $primary;
-        width: 70%;
-        height: 50%;
+        padding: 1 2;
+        layout: vertical;
         align: center middle;
-        padding: 2;
-        content-align: center middle;
+    }
+    #ingest-title {
+        text-align: center;
+        width: 100%;
+        margin-bottom: 1;
+    }
+    #ingest-current {
+        text-align: center;
+        width: 100%;
+        height: auto;
+        min-height: 3;
+        margin: 1 0;
+        padding: 0 1;
+        background: $primary 12%;
+        border: solid $primary 35%;
+    }
+    #ingest-log {
+        width: 100%;
+        height: 16;
+        min-height: 8;
+        border: solid $primary 40%;
+        background: $surface;
+        margin-top: 1;
+        padding: 0 1;
     }
     """
-    
+
     def __init__(self, raw_repo_input: str | None):
         super().__init__()
         self.raw_repo_input = raw_repo_input
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="ingestion-dialog"):
-            yield Static("🚀 [bold magenta]Initializing DeepCode Repository[/bold magenta]", id="ingest-title", classes="panel-title")
-            yield LoadingIndicator()
-            yield Static("Scanning file trees, compiling symbols, extracting embeddings...", id="ingest-status")
+        with Container(id="ingest-backdrop"):
+            with Vertical(id="ingestion-dialog"):
+                yield Static(
+                    "🚀 [bold magenta]Initializing DeepCode[/bold magenta]\n"
+                    "[dim]Repository scan, chunking, embeddings, and intel[/dim]",
+                    id="ingest-title",
+                )
+                yield Static(
+                    "[dim]Starting…[/dim]",
+                    id="ingest-current",
+                )
+                yield RichLog(id="ingest-log", auto_scroll=True, wrap=True, markup=True)
 
-    async def on_mount(self) -> None:
-        self.run_ingestion()
-        
-    @work
-    async def run_ingestion(self) -> None:
-        from app.core.repo_manager import resolve_and_prepare_repo_async
-        
-        def _echo(msg: str) -> None:
+    def _schedule_status(self, msg: str) -> None:
+        """Marshal UI updates onto the Textual message pump (safe from workers)."""
+        safe = escape(msg)
+
+        def _apply() -> None:
             try:
-                self.query_one("#ingest-status", Static).update(msg)
+                self.query_one("#ingest-current", Static).update(
+                    f"[bold cyan]{safe}[/bold cyan]"
+                )
+                self.query_one("#ingest-log", RichLog).write(f"[dim]•[/dim] {safe}")
             except Exception:
                 pass
 
-        # Synchronous execution bound safely within Textual Worker
-        repo_path, repo_id = await resolve_and_prepare_repo_async(self.raw_repo_input, echo=_echo)
+        try:
+            self.app.call_next(_apply)
+        except Exception:
+            _apply()
+
+    async def on_mount(self) -> None:
+        self.run_ingestion()
+
+    @work
+    async def run_ingestion(self) -> None:
+        from app.core.repo_manager import resolve_and_prepare_repo_async
+
+        def _echo(msg: str) -> None:
+            self._schedule_status(msg)
+
+        repo_path, repo_id = await resolve_and_prepare_repo_async(
+            self.raw_repo_input, echo=_echo
+        )
         self.app.apply_repo_context(repo_id, repo_path)
         self.dismiss()
 
@@ -205,7 +265,7 @@ class DeepCodeTuiApp(App):
             "[dim]Pipeline meta and trace appear here after each reply. "
             "Try /metrics or /trace.[/dim]"
         )
-        self._mount_chat(chatfmt.system_block(f"[bold green]✓ Ingestion Complete.[/bold green] Repository indexed implicitly!"))
+        self._mount_chat(chatfmt.ingest_ready_banner())
         
     def _chat_scroll(self) -> VerticalScroll:
         return self.query_one("#chat-scroll", VerticalScroll)

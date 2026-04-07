@@ -1,8 +1,11 @@
 """
 Vector store — inserts code chunks with embeddings into PostgreSQL.
 """
+from __future__ import annotations
+
 import json
 import uuid
+from collections.abc import Callable
 
 from tqdm import tqdm
 
@@ -20,26 +23,37 @@ async def insert_chunks(
     chunks: list[dict],
     provider: LLMProvider,
     batch_size: int = 20,
+    *,
+    status_callback: Callable[[str], None] | None = None,
 ) -> int:
     inserted = 0
+    total = len(chunks)
+    if status_callback and total:
+        status_callback(f"Embedding {total} chunks into vectors…")
 
     async with async_session_factory() as db:
         for i, chunk in enumerate(tqdm(chunks, desc="Embedding & storing", unit="chunk")):
             try:
                 embedding = await provider.embed(chunk["content"])
                 clean_content = chunk["content"].replace("\x00", "")
+                if not embedding:
+                    logger.warning(
+                        "Skipping chunk %s:%d — embedding API returned no vector",
+                        chunk["file_path"],
+                        chunk["chunk_index"],
+                    )
+                    continue
                 ev = None
-                if embedding:
-                    if len(embedding) == _settings.EMBEDDING_DIMENSION:
-                        ev = embedding
-                    else:
-                        logger.warning(
-                            "Embedding length %d != EMBEDDING_DIMENSION %d — "
-                            "pgvector column skipped; set EMBEDDING_DIMENSION to %d and re-init DB.",
-                            len(embedding),
-                            _settings.EMBEDDING_DIMENSION,
-                            len(embedding),
-                        )
+                if len(embedding) == _settings.EMBEDDING_DIMENSION:
+                    ev = embedding
+                else:
+                    logger.warning(
+                        "Embedding length %d != EMBEDDING_DIMENSION %d — "
+                        "pgvector column skipped; set EMBEDDING_DIMENSION to %d and re-init DB.",
+                        len(embedding),
+                        _settings.EMBEDDING_DIMENSION,
+                        len(embedding),
+                    )
 
                 row = CodeChunk(
                     id=uuid.uuid4(),
@@ -54,9 +68,16 @@ async def insert_chunks(
                 db.add(row)
                 inserted += 1
 
+                if status_callback and total > 1 and (i + 1) % max(10, batch_size) == 0:
+                    status_callback(f"Embedding progress: {i + 1} / {total} chunks")
+
                 if (i + 1) % batch_size == 0:
                     await db.commit()
                     logger.info("Committed batch %d (%d chunks)", (i + 1) // batch_size, inserted)
+                    if status_callback:
+                        status_callback(
+                            f"Embedded & saved batch — {inserted} / {total} chunks committed"
+                        )
 
             except Exception as exc:
                 logger.warning(
@@ -68,6 +89,9 @@ async def insert_chunks(
                 continue
 
         await db.commit()
+
+    if status_callback:
+        status_callback(f"Database write finished — {inserted} / {total} chunks stored")
 
     logger.info("Inserted %d/%d chunks into code_chunks", inserted, len(chunks))
     return inserted

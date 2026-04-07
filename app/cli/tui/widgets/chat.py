@@ -19,6 +19,14 @@ def system_block(text: str) -> str:
     return f"[yellow]{escape(text)}[/yellow]"
 
 
+def ingest_ready_banner() -> str:
+    """Trusted Rich markup for post-index TUI banner (do not pass user input)."""
+    return (
+        "[yellow][bold green]✓ Ingestion complete.[/bold green] "
+        "[dim]Repository indexed — you can ask questions.[/dim][/yellow]"
+    )
+
+
 def error_block(text: str) -> str:
     return f"[bold red]Error[/bold red]\n{escape(text)}"
 
