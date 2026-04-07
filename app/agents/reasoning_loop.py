@@ -470,7 +470,7 @@ Rules:
 - get_file_dependencies: args {"path": "app/foo.py", "limit": 30} — import graph (indexed repo + DB)
 - get_symbol_dependencies: args {"name": "SymbolName", "limit": 20} — symbol → file + import neighborhood
 - search: args {"query": "snippet"} or {"queries": ["a","b"]}
-- shell.run_command: args {"command": "single-line shell string", "cwd": "optional relative dir", "title": "optional short label"} — requires user approval in UI; use for checks like tests or syntax (not for destructive ops without explicit user intent).
+- shell.run_command: only when the task is structured (navigation/git/debugging-style); args {"command": "single-line shell string", "cwd": "optional relative dir", "title": "optional short label"} — user approval in UI; destructive/write commands show extra warnings.
 - git_log: args {} or {"file_path": "optional", "n": 10}
 - Set tool null, action "done", done true when further tools are unnecessary.
 """
@@ -498,7 +498,7 @@ Rules:
 - file_edit.checkpoint_session: args {} — save in-session edit state (used on subgoal failure to keep last good checkpoint).
 - file_edit.commit_session: args {"allowed_files":["app/x.py",...]} — force early persist (optional).
 - file_edit.rollback_session: args {} — discard uncommitted in-session edits.
-- shell.run_command: args {"command": "single-line shell string", "cwd": "optional relative dir", "title": "optional short label"} — requires user approval in UI.
+- shell.run_command: only for structured tasks; args {"command": "...", "cwd": "optional relative", "title": "optional"} — UI approval; writes/destructive commands are flagged.
 - git_log: args {} or {"file_path": "optional", "n": 10}
 - Set tool null, action "done", done true when further tools are unnecessary.
 """
@@ -582,9 +582,16 @@ async def run_reasoning_loop(
         max_steps = min(max_steps, 2)
 
     intent = (state.get("classification") or {}).get("agent_intent", "exploratory")
-    if intent == "broad":
+    intent_s = str(intent or "exploratory").lower().strip()
+    if intent_s == "broad":
         state["react_force_rag"] = True
         max_steps = min(max_steps, 1)
+
+    shell_ok = intent_s == "structured"
+    if bool(state.get("long_run_mode")):
+        shell_ok = shell_ok and bool(
+            getattr(settings, "LONG_RUN_SHELL_ENABLED", False)
+        )
 
     q = state.get("current_step") or state.get("query") or ""
     router = state.get("selected_tool")
@@ -603,7 +610,7 @@ async def run_reasoning_loop(
         "git_blame": 2,
         "search_logs": 2,
         "get_recent_failures": 2,
-        "run_command": 3,
+        "run_command": 2,
     }
     if cls_loop < 0.4:
         _ACTION_SOFT_LIMITS["list_dir"] = max(_ACTION_SOFT_LIMITS["list_dir"], 4)
@@ -631,7 +638,7 @@ async def run_reasoning_loop(
     state["react_useful_steps"] = 0
     state["react_failed_steps"] = 0
     state["react_edit_line_estimate"] = 0
-    state["react_force_rag"] = intent == "broad"
+    state["react_force_rag"] = intent_s == "broad"
     state["file_scores"] = dict(state.get("file_scores") or {})
     file_scores: dict[str, float] = defaultdict(float)
     last_touch_step: dict[str, int] = {}
@@ -827,9 +834,11 @@ async def run_reasoning_loop(
             args_preview=json.dumps(args, default=str) if args else None,
         )
 
-        valid_tools = ("file", "git", "log", "shell")
+        valid_tools: tuple[str, ...] = ("file", "git", "log")
         if _edit_tool_enabled(state):
-            valid_tools = ("file", "file_edit", "git", "log", "shell")
+            valid_tools = ("file", "file_edit", "git", "log")
+        if shell_ok:
+            valid_tools = valid_tools + ("shell",)
         if tool_name not in valid_tools:
             state["react_observations"].append(
                 f"Step {i}: invalid tool {tool_name!r} — stopping."
@@ -970,6 +979,7 @@ async def run_reasoning_loop(
         exec_args = dict(args)
         if tool_name == "shell":
             exec_args["confirm_shell_callback"] = state.get("confirm_shell_callback")
+            exec_args["long_run_mode"] = bool(state.get("long_run_mode"))
         try:
             res = await registry.execute_tool(tool_name, action, **exec_args)
         except Exception as exc:

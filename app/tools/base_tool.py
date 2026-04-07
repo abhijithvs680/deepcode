@@ -13,6 +13,10 @@ class ToolResult(BaseModel):
     data: Dict[str, Any] = Field(default_factory=dict, description="Standard structured data retrieved by the tool.")
     metadata: Dict[str, Any] = Field(default_factory=dict, description="Metrics surrounding execution (size restrictions, latencies, etc).")
     error: Optional[str] = Field(None, description="Explicit error payloads if the execution hit exceptions over boundaries.")
+    retryable: bool = Field(
+        default=False,
+        description="True when the caller may succeed later (e.g. after enabling interactive approval).",
+    )
     timestamp: float = Field(default_factory=time.time, description="Epoch timestamp routing recency integrations dynamically.")
 
 class Tool:

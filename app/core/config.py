@@ -129,6 +129,8 @@ class Settings(BaseSettings):
 
     # Multi-cycle macro goals (TUI /run, long_run_agent)
     LONG_RUN_ENABLED: bool = True
+    # When False (default), ReAct shell tool is disabled during long-run tasks (avoids UI stalls).
+    LONG_RUN_SHELL_ENABLED: bool = False
     LONG_RUN_MAX_CYCLES: int = 20
     # Wall-clock and step budgets for macro runs (0 = no limit)
     LONG_RUN_MAX_RUNTIME_SECONDS: int = 0

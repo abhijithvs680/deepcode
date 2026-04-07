@@ -158,6 +158,7 @@ _SUBSTATE_KEYS = frozenset(
         "stream_callback",
         "react_event_callback",
         "confirm_shell_callback",
+        "long_run_mode",
         "react_cancel_event",
         "fallbacks_local",
         "dry_run",

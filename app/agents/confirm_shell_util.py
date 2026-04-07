@@ -18,6 +18,8 @@ async def invoke_confirm_shell_callback(
     title: str | None = None,
     cwd: str | None = None,
     tag_labels: list[str] | None = None,
+    warning: str | None = None,
+    risk: str | None = None,
 ) -> ShellConfirmChoice:
     """
     Ask the UI whether to run a shell command.
@@ -39,6 +41,10 @@ async def invoke_confirm_shell_callback(
             kw["cwd"] = cwd
         if "tag_labels" in sig.parameters:
             kw["tag_labels"] = tag_labels
+        if "warning" in sig.parameters:
+            kw["warning"] = warning
+        if "risk" in sig.parameters:
+            kw["risk"] = risk
         out = confirm_cb(command, **kw)
     if inspect.isawaitable(out):
         out = await out

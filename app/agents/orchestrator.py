@@ -352,6 +352,7 @@ class AgentOrchestrator:
             "cross_subgoal_meta": {},
             "next_subgoal_bias": [],
             "active_working_set": [],
+            "long_run_mode": bool(kwargs.get("long_run_mode")),
         }
         for _cb_key in (
             "stream_callback",

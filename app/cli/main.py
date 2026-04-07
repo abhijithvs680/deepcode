@@ -80,11 +80,13 @@ repos_app = typer.Typer(help="Manage registered repositories")
 app.add_typer(repos_app, name="repos")
 
 
-def _launch_ui(repo: Optional[str], *, ide: bool = False) -> None:
+def _launch_ui(
+    repo: Optional[str], *, ide: bool = False, debug: bool = False
+) -> None:
     if ide:
         from app.cli.tui.ide_app import run_ide_tui
 
-        run_ide_tui(raw_repo_input=repo)
+        run_ide_tui(raw_repo_input=repo, debug=debug)
         return
     from app.cli.tui.app import run_tui
 
@@ -120,9 +122,15 @@ def ui_cli(
         "--ide",
         help="Agent IDE layout (chat · editor/diff · explorer + event terminal).",
     ),
+    debug: bool = typer.Option(
+        False,
+        "--debug",
+        "-d",
+        help="With --ide: show step/event trace above the terminal dock.",
+    ),
 ) -> None:
     """Interactive TUI: resolve repo, ensure index, then chat."""
-    _launch_ui(repo, ide=ide)
+    _launch_ui(repo, ide=ide, debug=debug)
 
 @app.command("doctor")
 def cmd_doctor() -> None:

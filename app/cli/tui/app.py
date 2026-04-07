@@ -82,6 +82,10 @@ class ConfirmShellScreen(ModalScreen[str]):
         margin-bottom: 1;
         color: $text-muted;
     }
+    #shell-warning {
+        margin-bottom: 1;
+        color: $warning;
+    }
     #shell-cmd {
         width: 100%;
         min-height: 3;
@@ -106,12 +110,16 @@ class ConfirmShellScreen(ModalScreen[str]):
         title: str | None = None,
         tag_labels: list[str] | None = None,
         cwd_hint: str | None = None,
+        warning: str | None = None,
+        risk: str | None = None,
     ):
         super().__init__()
         self.command = (command or "").strip()
         self.title_text = (title or "Run shell command").strip() or "Run shell command"
         self.tag_labels = [str(x) for x in (tag_labels or []) if str(x).strip()][:8]
         self.cwd_hint = (cwd_hint or "").strip()
+        self.warning = (warning or "").strip()
+        self.risk = (risk or "").strip()
 
     def compose(self) -> ComposeResult:
         with Container(id="shell-backdrop"):
@@ -120,9 +128,13 @@ class ConfirmShellScreen(ModalScreen[str]):
                 title_markup = f"[bold]{escape(self.title_text)}[/bold]"
                 if tags:
                     title_markup += f"  [dim]{tags}[/dim]"
+                if self.risk:
+                    title_markup += f"  [dim]({escape(self.risk)})[/dim]"
                 yield Static(title_markup, id="shell-title")
                 if self.cwd_hint:
                     yield Static(f"cwd: {escape(self.cwd_hint)}", id="shell-cwd")
+                if self.warning:
+                    yield Static(self.warning, id="shell-warning", markup=True)
                 yield Static(f"$ {escape(self.command)}", id="shell-cmd")
                 with Horizontal(id="shell-buttons"):
                     yield Button("Skip", id="btn_skip", variant="default")
@@ -675,6 +687,8 @@ class DeepCodeTuiApp(App):
             title: str | None = None,
             cwd: str | None = None,
             tag_labels: list[str] | None = None,
+            warning: str | None = None,
+            risk: str | None = None,
         ) -> str:
             return await self.push_screen_wait(
                 ConfirmShellScreen(
@@ -682,6 +696,8 @@ class DeepCodeTuiApp(App):
                     title=title,
                     tag_labels=tag_labels,
                     cwd_hint=cwd,
+                    warning=warning,
+                    risk=risk,
                 )
             )
 

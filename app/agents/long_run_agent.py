@@ -433,12 +433,14 @@ async def run_long_goal(
         ctx = build_long_run_context(state, task)
         if extra_context and str(extra_context).strip():
             ctx = f"{str(extra_context).strip()}\n\n{ctx}"
+        orch_kw = dict(orch_kwargs)
+        orch_kw["long_run_mode"] = True
         res = await orchestrator.run(
             question=str(task.get("description", "")),
             context=ctx,
             repo_id=repo_id,
             mode="edit",
-            **orch_kwargs,
+            **orch_kw,
         )
         results.append(res)
         ans = (res.get("answer") or "").strip()

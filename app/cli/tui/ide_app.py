@@ -69,7 +69,19 @@ class DeepCodeIdeApp(App):
     #ide-editor-path { padding: 0 1; background: $panel; height: 1; }
     #ide-editor-body { height: 1fr; padding: 0 1; }
     #ide-explorer-scroll { height: 1fr; padding: 0 1; }
-    #ide-status-strip { height: auto; min-height: 1; padding: 0 1; background: $warning 8%; }
+    #ide-orchestrator-bar {
+        height: auto;
+        min-height: 1;
+        padding: 0 1;
+        background: $warning 8%;
+        border-bottom: solid $primary 20%;
+    }
+    #ide-debug-trace {
+        height: 8;
+        min-height: 4;
+        border-top: solid $primary 15%;
+        border-bottom: solid $primary 15%;
+    }
     #ide-bottom-dock {
         height: 10;
         min-height: 4;
@@ -84,9 +96,12 @@ class DeepCodeIdeApp(App):
     #input { border: tall $primary 30%; margin: 0 1 1 1; dock: bottom; }
     """
 
-    def __init__(self, *, raw_repo_input: str | None = None) -> None:
+    def __init__(
+        self, *, raw_repo_input: str | None = None, debug: bool = False
+    ) -> None:
         super().__init__()
         self.raw_repo_input = raw_repo_input
+        self._ide_debug = bool(debug)
         self._repo_id = None
         self._repo_path = None
         self.ide_state = IDEState()
@@ -110,9 +125,17 @@ class DeepCodeIdeApp(App):
                 yield VerticalScroll(id="ide-editor-body")
             with Vertical(id="ide-explorer-col"):
                 yield Static("Explorer", classes="ide-panel-title")
-                yield Static("", id="ide-status-strip")
                 yield VerticalScroll(id="ide-explorer-scroll")
         with Vertical(id="ide-bottom-dock"):
+            yield Static("", id="ide-orchestrator-bar")
+            if self._ide_debug:
+                yield Static("Debug trace", classes="ide-panel-title")
+                yield RichLog(
+                    id="ide-debug-trace",
+                    auto_scroll=True,
+                    wrap=True,
+                    markup=True,
+                )
             yield Static("Terminal", classes="ide-panel-title")
             yield RichLog(id="ide-shell-out", auto_scroll=True, wrap=True, markup=True)
             yield Input(placeholder="Shell command… Enter", id="ide-shell-in")
@@ -228,8 +251,12 @@ class DeepCodeIdeApp(App):
                         classes="chat-line",
                     )
                 )
-                st = self.query_one("#ide-status-strip", Static)
-                st.update(self.ide_state.status_bar_text())
+                obar = self.query_one("#ide-orchestrator-bar", Static)
+                obar.update(self.ide_state.status_bar_text())
+                if self._ide_debug:
+                    tr = self.query_one("#ide-debug-trace", RichLog)
+                    tr.clear()
+                    tr.write(self.ide_state.trace_panel_text())
                 tabs_w = self.query_one("#ide-editor-tabs", Static)
                 nt = len(self.ide_state.tabs)
                 cur = self.ide_state.active_tab_index + 1 if nt else 0
@@ -628,6 +655,8 @@ class DeepCodeIdeApp(App):
             title: str | None = None,
             cwd: str | None = None,
             tag_labels: list[str] | None = None,
+            warning: str | None = None,
+            risk: str | None = None,
         ) -> str:
             self.ide_state.ui_phase = "awaiting_shell"
             self.call_next(self._refresh_all_panels)
@@ -638,6 +667,8 @@ class DeepCodeIdeApp(App):
                         title=title,
                         tag_labels=tag_labels,
                         cwd_hint=cwd,
+                        warning=warning,
+                        risk=risk,
                     )
                 )
             finally:
@@ -785,8 +816,10 @@ class DeepCodeIdeApp(App):
         self._chat_scroll().scroll_end(animate=False)
 
 
-def run_ide_tui(*, raw_repo_input: str | None = None) -> None:
+def run_ide_tui(
+    *, raw_repo_input: str | None = None, debug: bool = False
+) -> None:
     from app.core.logger import quiet_app_loggers_for_tui
 
     quiet_app_loggers_for_tui()
-    DeepCodeIdeApp(raw_repo_input=raw_repo_input).run()
+    DeepCodeIdeApp(raw_repo_input=raw_repo_input, debug=debug).run()
