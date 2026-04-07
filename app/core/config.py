@@ -91,12 +91,22 @@ class Settings(BaseSettings):
     ORCHESTRATOR_MAX_ITERATIONS: int = 16
     # Ask mode: if classifier confidence is below this, skip planner/ReAct/RAG and answer directly.
     ORCHESTRATOR_LOW_SIGNAL_CONFIDENCE: float = 0.35
-    # When low-signal but query looks like repo exploration, cap ReAct at this many steps.
-    REACT_LOW_SIGNAL_PROBE_MAX_STEPS: int = 1
+    # Low-signal repo exploration probe: steps for smaller workspaces (see REACT_PROBE_LARGE_REPO_MIN_FILES).
+    REACT_LOW_SIGNAL_PROBE_MAX_STEPS: int = 2
+    # If os.walk sees at least this many files, probe may use REACT_LOW_SIGNAL_PROBE_MAX_STEPS_LARGE_REPO.
+    REACT_PROBE_LARGE_REPO_MIN_FILES: int = 400
+    REACT_LOW_SIGNAL_PROBE_MAX_STEPS_LARGE_REPO: int = 3
     # Applied once per ReAct session to file_scores before staleness (counteracts +edit/+error boosts).
     REACT_FILE_SCORE_DECAY: float = 0.97
-    # Ask mode: allow shell for obvious test/install commands when classifier confidence is at least this.
+    # Paths from last ReAct session's edited/error boosts skip one decay pass (see reasoning_loop).
+    # Ask mode shell: stricter when query is only vaguely task-like vs explicit pytest/npm/pip patterns.
+    REACT_ASK_MODE_SHELL_MIN_CONFIDENCE_EXPLICIT: float = 0.4
+    REACT_ASK_MODE_SHELL_MIN_CONFIDENCE_DEFAULT: float = 0.6
+    # Ask mode: legacy single threshold (unused if explicit/default pair is read in reasoning_loop)
     REACT_ASK_MODE_SHELL_MIN_CONFIDENCE: float = 0.55
+    # When True, ask mode delays shell + mutating file_edit until after a useful read/search/deps step
+    # (skipped for edit mode, write_enabled, structured intent, long_run, or explicit task-shell queries).
+    REACT_EXPLORATION_FIRST: bool = True
 
     # ReAct-style tool-first exploration (RAG only when context is insufficient)
     REACT_AGENT_ENABLED: bool = True

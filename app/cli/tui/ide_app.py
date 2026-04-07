@@ -16,7 +16,9 @@ from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import Footer, Header, Input, RichLog, Static
+from textual.widgets import Footer, Header, RichLog, Static
+
+from app.cli.tui.widgets.ide_composer import IdeComposer
 
 from app.cli.commands.ask import run_ask_async, run_long_goal_async
 from app.cli.tui.app import ConfirmDiffScreen, ConfirmShellScreen, IngestionLoaderScreen
@@ -168,12 +170,42 @@ class DeepCodeIdeApp(App):
         min-height: 5;
         padding: 0 1;
     }
-    #ide-orchestrator-bar {
+    Static.ide-chat-events {
+        padding: 0 1 0 1;
+        margin: 0 0 0 0;
+        background: $panel 40%;
+        border-left: outer #007acc 35%;
         height: auto;
         min-height: 1;
-        padding: 0 1;
-        background: $warning 8%;
-        border-top: solid $primary 15%;
+    }
+    #ide-composer-stack {
+        layout: vertical;
+        height: auto;
+        min-height: 3;
+        margin: 0 1 1 1;
+        padding: 0;
+        border: round #3c3c3c;
+        background: #1a1a1a;
+    }
+    IdeComposer {
+        height: 4;
+        min-height: 3;
+        max-height: 10;
+        border: none;
+        background: #1a1a1a;
+        color: #d4d4d4;
+        padding: 0 1 0 1;
+    }
+    IdeComposer:focus {
+        border: none;
+    }
+    #ide-composer-hint {
+        height: auto;
+        min-height: 1;
+        padding: 0 1 0 1;
+        background: #252526;
+        color: $text-muted;
+        border-top: solid #3c3c3c;
     }
     #ide-debug-trace {
         height: 6;
@@ -181,17 +213,16 @@ class DeepCodeIdeApp(App):
         border-bottom: solid $primary 15%;
     }
     #ide-shell-out { height: 1fr; min-height: 3; }
-    #ide-editor-tabs { height: 1; padding: 0 1; background: $panel 80%; }
-    #input {
-        background: #2d2d30;
-        color: #d4d4d4;
+    #ide-shell-prompt {
+        min-height: 1;
+        height: auto;
+        padding: 0 1;
+        margin: 0;
+        background: #252526;
         border: solid #007acc;
-        margin: 0 1 1 1;
-        height: 1;
+        border-top: solid #007acc;
     }
-    #input:focus {
-        border: solid #1b8ce8;
-    }
+    #ide-editor-tabs { height: 1; padding: 0 1; background: $panel 80%; }
     """
 
     def __init__(
@@ -209,6 +240,8 @@ class DeepCodeIdeApp(App):
         self._ev_debounce = IdeEventDebouncer(
             interval_s=0.1, on_flush=self._on_debounced_events
         )
+        self._shell_intro_written = False
+        self._active_run_events_static: Static | None = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -216,11 +249,15 @@ class DeepCodeIdeApp(App):
             with Vertical(id="ide-chat"):
                 yield Static("Chat", classes="ide-panel-title")
                 yield VerticalScroll(id="ide-chat-scroll")
-                yield Static("", id="ide-orchestrator-bar")
-                yield Input(
-                    placeholder="Message…  Ctrl+P  /ask /edit /run /plan /metrics",
-                    id="input",
-                )
+                with Vertical(id="ide-composer-stack"):
+                    yield IdeComposer(
+                        "",
+                        id="input",
+                        placeholder="Add a follow-up",
+                        show_line_numbers=False,
+                        soft_wrap=True,
+                    )
+                    yield Static("", id="ide-composer-hint")
             with Vertical(id="ide-center"):
                 with Vertical(id="ide-editor-stack"):
                     yield Static("Editor / Diff", classes="ide-panel-title")
@@ -263,7 +300,16 @@ class DeepCodeIdeApp(App):
 
     def on_mount(self) -> None:
         self._ev_debounce.bind_app(self)
-        self.query_one("#input", Input).focus()
+        try:
+            self.query_one("#input", IdeComposer).focus()
+        except Exception:
+            pass
+        try:
+            self.query_one("#ide-composer-hint", Static).update(
+                self.ide_state.composer_chrome_hint()
+            )
+        except Exception:
+            pass
         try:
             self.query_one("#ide-shell-out", RichLog).can_focus = False
             if self._ide_debug:
@@ -274,6 +320,7 @@ class DeepCodeIdeApp(App):
             self.query_one("#ide-shell-prompt", ShellPromptLine).refresh_tip()
         except Exception:
             pass
+        self._shell_intro_once()
         self.push_screen(IngestionLoaderScreen(self.raw_repo_input))
 
     def on_unmount(self) -> None:
@@ -293,7 +340,9 @@ class DeepCodeIdeApp(App):
         if self._repo_path:
             self.sub_title = f"{settings.LLM_MODEL} | {Path(self._repo_path).name}"
         self._dispose_shell_worker()
+        self._shell_intro_written = False
         self._mount_chat(chatfmt.ingest_ready_banner())
+        self._shell_intro_once()
         self._refresh_all_panels()
         try:
             self.query_one("#ide-shell-prompt", ShellPromptLine).refresh_tip()
@@ -409,8 +458,17 @@ class DeepCodeIdeApp(App):
                         classes="chat-line",
                     )
                 )
-                obar = self.query_one("#ide-orchestrator-bar", Static)
-                obar.update(self.ide_state.status_bar_text())
+                ar = getattr(self, "_active_run_events_static", None)
+                if ar is not None:
+                    try:
+                        ar.update(self.ide_state.run_events_panel_text())
+                    except Exception:
+                        pass
+                try:
+                    hint = self.query_one("#ide-composer-hint", Static)
+                    hint.update(self.ide_state.composer_chrome_hint())
+                except Exception:
+                    pass
                 if self._ide_debug:
                     tr = self.query_one("#ide-debug-trace", RichLog)
                     tr.clear()
@@ -564,6 +622,20 @@ class DeepCodeIdeApp(App):
 
     def _clear_chat_only(self) -> None:
         self._chat_scroll().remove_children()
+        self._active_run_events_static = None
+
+    def _shell_intro_once(self) -> None:
+        if getattr(self, "_shell_intro_written", False):
+            return
+        try:
+            lg = self.query_one("#ide-shell-out", RichLog)
+            lg.write(
+                "[dim]Interactive shell — click the prompt row below or Ctrl+Shift+T, "
+                "then type and press Enter (one line per run).[/dim]"
+            )
+            self._shell_intro_written = True
+        except Exception:
+            pass
 
     def action_clear_chat(self) -> None:
         self._clear_chat_only()
@@ -582,19 +654,19 @@ class DeepCodeIdeApp(App):
         result = await self.push_screen_wait(CommandPaletteScreen())
         if result is not None:
             if result.endswith(" "):
-                inp = self.query_one("#input", Input)
-                inp.value = result
+                inp = self.query_one("#input", IdeComposer)
+                inp.text = result
                 inp.focus()
-                try:
-                    inp.cursor_position = len(result)
-                except Exception:
-                    pass
             else:
                 self._handle_slash(result)
 
-    async def on_input_changed(self, event: Input.Changed) -> None:
-        if event.input.id == "input" and event.value == "/":
-            event.input.value = ""
+    @on(IdeComposer.Changed)
+    def on_ide_composer_changed(self, event: IdeComposer.Changed) -> None:
+        ta = event.text_area
+        if getattr(ta, "id", None) != "input":
+            return
+        if ta.text == "/":
+            ta.text = ""
             self.action_command_palette()
 
     @work(exclusive=False, group="ide_shell")
@@ -636,13 +708,15 @@ class DeepCodeIdeApp(App):
         if raw:
             self._run_shell_command(raw)
 
-    def on_input_submitted(self, event: Input.Submitted) -> None:
+    @on(IdeComposer.Submitted)
+    def on_ide_composer_submitted(self, event: IdeComposer.Submitted) -> None:
         if getattr(self, "_orchestrator_busy", False):
             return
-        if event.input.id != "input":
-            return
-        raw = event.value.strip()
-        event.input.value = ""
+        raw = (event.text or "").strip()
+        try:
+            self.query_one("#input", IdeComposer).text = ""
+        except Exception:
+            pass
         if not raw:
             return
         mode = "ask"
@@ -775,9 +849,16 @@ class DeepCodeIdeApp(App):
         long_run: bool = False,
     ) -> None:
         self._mount_chat(chatfmt.user_block(question))
-        answer_widget = Static(chatfmt.assistant_label() + "\n", classes="chat-line")
-        self._chat_scroll().mount(answer_widget)
-        self._chat_scroll().scroll_end(animate=False)
+        answer_body = Static(chatfmt.assistant_label() + "\n", classes="chat-line")
+        events_w = Static(
+            self.ide_state.run_events_panel_text(),
+            classes="chat-line ide-chat-events",
+        )
+        self._active_run_events_static = events_w
+        scroll = self._chat_scroll()
+        scroll.mount(answer_body)
+        scroll.mount(events_w)
+        scroll.scroll_end(animate=False)
         self._final_answer_via_bus = False
 
         stream_buffer = ""
@@ -786,7 +867,7 @@ class DeepCodeIdeApp(App):
         last_update_t = time.perf_counter()
 
         def _apply_answer_markup(markup: str) -> None:
-            answer_widget.update(markup)
+            answer_body.update(markup)
             self._chat_scroll().scroll_end(animate=False)
 
         async def _stream_callback(chunk: str) -> None:
@@ -867,7 +948,7 @@ class DeepCodeIdeApp(App):
                     pass
 
                 def _apply_final() -> None:
-                    answer_widget.update(
+                    answer_body.update(
                         chatfmt.assistant_label() + "\n" + escape(content)
                     )
                     self._chat_scroll().scroll_end(animate=False)
@@ -884,7 +965,7 @@ class DeepCodeIdeApp(App):
         self.ide_state.terminal_log.clear()
         self.ide_state.orchestrator_status_line = ""
         try:
-            self.query_one("#input", Input).disabled = True
+            self.query_one("#input", IdeComposer).disabled = True
         except Exception:
             pass
 
@@ -920,7 +1001,7 @@ class DeepCodeIdeApp(App):
                     react_cancel_event=self._react_cancel_event,
                 )
         except Exception as exc:
-            answer_widget.update(chatfmt.error_block(str(exc)))
+            answer_body.update(chatfmt.error_block(str(exc)))
             self._chat_scroll().scroll_end(animate=False)
             return
         finally:
@@ -932,10 +1013,11 @@ class DeepCodeIdeApp(App):
             self._orchestrator_busy = False
             self.ide_state.ui_phase = "idle"
             self.ide_state.orchestrator_status_line = ""
+            self.call_next(self._refresh_all_panels)
 
             def _unlock() -> None:
                 try:
-                    w = self.query_one("#input", Input)
+                    w = self.query_one("#input", IdeComposer)
                     w.disabled = False
                     w.focus()
                 except Exception:

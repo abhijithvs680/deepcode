@@ -20,7 +20,9 @@ from app.agents.react_grounding import (
     extract_goal,
     goal_progress_delta,
     keyword_relevance,
+    looks_like_explicit_task_command,
     looks_like_task_execution_query,
+    scaffold_shell_hint,
 )
 from app.core.config import get_settings
 from app.core.event_bus import EventBus
@@ -647,23 +649,43 @@ async def run_reasoning_loop(
     if bool(state.get("react_low_signal_repo_probe")):
         pm = int(
             state.get("react_probe_max_steps")
-            or getattr(settings, "REACT_LOW_SIGNAL_PROBE_MAX_STEPS", 1)
-            or 1
+            or getattr(settings, "REACT_LOW_SIGNAL_PROBE_MAX_STEPS", 2)
+            or 2
         )
         max_steps = max(1, min(pm, hard_cap))
 
     q = state.get("current_step") or state.get("query") or ""
 
-    shell_ok = intent_s == "structured"
-    ask_shell_min = float(
-        getattr(settings, "REACT_ASK_MODE_SHELL_MIN_CONFIDENCE", 0.55) or 0.55
+    task_like_shell = looks_like_task_execution_query(str(q))
+    ask_shell_thr = float(
+        getattr(settings, "REACT_ASK_MODE_SHELL_MIN_CONFIDENCE_DEFAULT", 0.6) or 0.6
     )
+    if task_like_shell and looks_like_explicit_task_command(str(q)):
+        ask_shell_thr = float(
+            getattr(settings, "REACT_ASK_MODE_SHELL_MIN_CONFIDENCE_EXPLICIT", 0.4)
+            or 0.4
+        )
+
+    explore_first = bool(getattr(settings, "REACT_EXPLORATION_FIRST", True))
+    mode_ask = str(state.get("mode") or "").lower() == "ask"
+    mode_edit = str(state.get("mode") or "").lower() == "edit"
+    write_on = bool(state.get("write_enabled"))
+    state["react_execution_allowed"] = bool(
+        not explore_first
+        or mode_edit
+        or write_on
+        or task_like_shell
+        or intent_s == "structured"
+        or bool(state.get("long_run_mode"))
+    )
+
+    shell_ok = intent_s == "structured"
     if (
         not shell_ok
-        and str(state.get("mode") or "").lower() == "ask"
+        and mode_ask
         and intent_s != "broad"
-        and cls_loop >= ask_shell_min
-        and looks_like_task_execution_query(str(q))
+        and cls_loop >= ask_shell_thr
+        and task_like_shell
     ):
         shell_ok = True
     if bool(state.get("long_run_mode")):
@@ -736,9 +758,17 @@ async def run_reasoning_loop(
         except (TypeError, ValueError):
             pass
 
+    exempt_decay: set[str] = set()
+    for p in state.get("prior_react_signal_paths") or []:
+        try:
+            exempt_decay.add(_norm_rel_path(str(p)))
+        except (TypeError, ValueError):
+            pass
     decay = float(getattr(settings, "REACT_FILE_SCORE_DECAY", 0.97) or 0.97)
     if 0 < decay < 1 and file_scores:
         for fk in list(file_scores.keys()):
+            if fk in exempt_decay:
+                continue
             try:
                 file_scores[fk] *= decay
             except (TypeError, ValueError):
@@ -854,6 +884,7 @@ async def run_reasoning_loop(
 
         user_block = (
             f"User task: {q}\n"
+            f"{scaffold_shell_hint(q)}"
             f"{edit_extra}"
             f"{hint_extra}"
             f"{_exploration_hint(i, max_steps, intent)}\n"
@@ -946,6 +977,55 @@ async def run_reasoning_loop(
                 state["react_early_stop_reason"] = "failed_steps_limit"
                 break
             continue
+
+        exec_allowed = bool(state.get("react_execution_allowed"))
+        if explore_first and not exec_allowed:
+            if tool_name == "shell":
+                state["react_observations"].append(
+                    f"Step {i}: shell deferred — explore the repo (read_file / search / "
+                    "dependencies) first, then run commands."
+                )
+                state["react_failed_steps"] += 1
+                await _emit_step_evt(
+                    state,
+                    phase="result",
+                    step=i,
+                    tool=tool_name,
+                    action=action,
+                    status="fail",
+                    summary="exploration phase",
+                    duration_ms=0,
+                )
+                if state["react_failed_steps"] >= 2:
+                    await _maybe_force_rag_escape_emit(state)
+                    state["react_early_stop_reason"] = "failed_steps_limit"
+                    break
+                continue
+            if tool_name == "file_edit" and action in (
+                "apply_search_replace",
+                "commit_session",
+            ):
+                if not (action == "apply_search_replace" and args.get("dry_run")):
+                    state["react_observations"].append(
+                        f"Step {i}: edits deferred — read relevant files first "
+                        "(exploration phase)."
+                    )
+                    state["react_failed_steps"] += 1
+                    await _emit_step_evt(
+                        state,
+                        phase="result",
+                        step=i,
+                        tool=tool_name,
+                        action=action,
+                        status="fail",
+                        summary="exploration phase",
+                        duration_ms=0,
+                    )
+                    if state["react_failed_steps"] >= 2:
+                        await _maybe_force_rag_escape_emit(state)
+                        state["react_early_stop_reason"] = "failed_steps_limit"
+                        break
+                    continue
 
         if tool_name == "file_edit" and action == "apply_search_replace":
             fp_chk = args.get("file_path") or args.get("path") or ""
@@ -1105,6 +1185,16 @@ async def run_reasoning_loop(
             state["react_useful_steps"] += 1
         else:
             state["react_failed_steps"] += 1
+
+        if (
+            explore_first
+            and useful
+            and res
+            and res.success
+            and tool_name in ("file", "git", "log")
+            and action != "run_command"
+        ):
+            state["react_execution_allowed"] = True
 
         dumped = res.model_dump() if res is not None else {}
         state["tool_results"].append(dumped)
@@ -1340,6 +1430,23 @@ async def run_reasoning_loop(
     }
     top_files = sorted(file_scores.keys(), key=lambda p: file_scores[p], reverse=True)[:2]
     state["react_priority_files"] = top_files
+
+    new_prior: set[str] = set()
+    for raw_ed in state.get("react_edited_paths") or []:
+        pk = _norm_rel_path(str(raw_ed))
+        if pk:
+            new_prior.add(pk)
+    for raw_er in state.get("react_error_paths") or []:
+        rel = _try_repo_relative(str(raw_er), ws_merge)
+        pk = rel or _norm_rel_path(str(raw_er))
+        if pk:
+            new_prior.add(pk)
+    prev_prior = {
+        _norm_rel_path(str(x))
+        for x in (state.get("prior_react_signal_paths") or [])
+        if x
+    }
+    state["prior_react_signal_paths"] = list(prev_prior | new_prior)[:120]
 
     state["tool_results"] = prior_tools + state["tool_results"]
     await _emit_react(

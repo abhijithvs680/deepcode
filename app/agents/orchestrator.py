@@ -470,6 +470,7 @@ class AgentOrchestrator:
             "query": question,
             "repo_id": repo_id,
             "workspace_root": ws_root,
+            "prior_react_signal_paths": [],
             "trace": trace,
             "embed_cache": {},
             "fallbacks_local": [],
@@ -520,10 +521,11 @@ class AgentOrchestrator:
                 compute_answer_confidence,
                 is_trivial_query,
                 looks_like_repo_exploration_query,
+                low_signal_probe_max_steps,
             )
             from app.core.event_bus import EventBus
 
-            if mode == "ask" and is_trivial_query(question):
+            if mode == "ask" and is_trivial_query(question, state):
                 prompt = (
                     "You are a helpful coding assistant. Reply briefly and naturally "
                     "(one short paragraph or less for greetings and tiny talk).\n\n"
@@ -554,16 +556,9 @@ class AgentOrchestrator:
             if mode == "ask" and cls_c0 < low_sig_thr:
                 if looks_like_repo_exploration_query(question):
                     state["react_low_signal_repo_probe"] = True
-                    state["react_probe_max_steps"] = max(
-                        1,
-                        int(
-                            getattr(
-                                self.settings,
-                                "REACT_LOW_SIGNAL_PROBE_MAX_STEPS",
-                                1,
-                            )
-                            or 1
-                        ),
+                    state["react_probe_max_steps"] = low_signal_probe_max_steps(
+                        self.settings,
+                        state.get("workspace_root"),
                     )
                 else:
                     prompt_ls = (
@@ -735,12 +730,10 @@ class AgentOrchestrator:
                                     1,
                                     int(
                                         state.get("react_probe_max_steps")
-                                        or getattr(
+                                        or low_signal_probe_max_steps(
                                             self.settings,
-                                            "REACT_LOW_SIGNAL_PROBE_MAX_STEPS",
-                                            1,
+                                            state.get("workspace_root"),
                                         )
-                                        or 1
                                     ),
                                 )
 
@@ -807,12 +800,10 @@ class AgentOrchestrator:
                                             1,
                                             int(
                                                 state.get("react_probe_max_steps")
-                                                or getattr(
+                                                or low_signal_probe_max_steps(
                                                     self.settings,
-                                                    "REACT_LOW_SIGNAL_PROBE_MAX_STEPS",
-                                                    1,
+                                                    state.get("workspace_root"),
                                                 )
-                                                or 1
                                             ),
                                         )
                                         sub["react_low_signal_repo_probe"] = True
@@ -832,6 +823,9 @@ class AgentOrchestrator:
                                             commit=subgoal_success(sub),
                                         )
                                     subgoal_runs.append((sg, sub))
+                                    state["prior_react_signal_paths"] = list(
+                                        sub.get("prior_react_signal_paths") or []
+                                    )
                                     state["active_working_set"] = (
                                         build_active_working_set(
                                             subgoal_runs, query=q_for_plan

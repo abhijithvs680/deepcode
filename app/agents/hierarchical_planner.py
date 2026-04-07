@@ -173,6 +173,7 @@ _SUBSTATE_KEYS = frozenset(
         "critic_retry_count",
         "latency_ms",
         "learned_file_bias",
+        "prior_react_signal_paths",
     }
 )
 
@@ -519,6 +520,17 @@ def merge_react_subgoal_results(
     parent_state["active_working_set"] = build_active_working_set(
         subgoal_runs, query=q_ws
     )
+    prior_union: set[str] = set()
+    for p in parent_state.get("prior_react_signal_paths") or []:
+        kn = str(p).replace("\\", "/").strip().lstrip("./")
+        if kn:
+            prior_union.add(kn)
+    for _sg, sub in subgoal_runs:
+        for p in sub.get("prior_react_signal_paths") or []:
+            kn = str(p).replace("\\", "/").strip().lstrip("./")
+            if kn:
+                prior_union.add(kn)
+    parent_state["prior_react_signal_paths"] = list(prior_union)[:120]
     if subgoal_runs:
         _last_sub = subgoal_runs[-1][1]
         r = str(_last_sub.get("react_early_stop_reason") or "").strip()
@@ -578,12 +590,27 @@ def build_active_working_set(
             out.append(p)
     out = out[:cap]
     qtxt = (query or "").strip()
-    if qtxt:
+    sym_tokens = [
+        str(s).strip().lower()
+        for s in merged_symbols_so_far(subgoal_runs)
+        if isinstance(s, str) and len(str(s).strip()) > 1
+    ]
+    if qtxt or sym_tokens:
         scored: list[tuple[float, int, str]] = []
         for idx, p in enumerate(out):
             base = p.split("/")[-1] if p else ""
-            rel = keyword_relevance(qtxt, p, base.replace("_", " "))
-            scored.append((rel, idx, p))
+            rel = (
+                keyword_relevance(qtxt, p, base.replace("_", " ")) if qtxt else 0.0
+            )
+            sym_boost = 0.0
+            pl = p.lower()
+            for sym in sym_tokens:
+                if len(sym) < 3:
+                    continue
+                if sym in pl or sym.replace("_", "") in pl.replace("_", ""):
+                    sym_boost = 2.0
+                    break
+            scored.append((rel + sym_boost, idx, p))
         scored.sort(key=lambda t: (-t[0], t[1]))
         out = [t[2] for t in scored][:cap]
     return out

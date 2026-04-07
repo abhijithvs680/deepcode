@@ -239,7 +239,7 @@ class AnswerAgent(BaseAgent):
                 len(react_observations),
             )
 
-        if is_trivial_query(question):
+        if is_trivial_query(question, state):
             grounding = (
                 "This is a short general or conversational message. Reply briefly and "
                 "naturally. You do not need repository evidence for greetings or simple "

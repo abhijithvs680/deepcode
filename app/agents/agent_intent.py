@@ -41,4 +41,24 @@ def derive_agent_intent(classification: dict[str, Any], query: str) -> str:
     ):
         return "structured"
 
+    if any(
+        phrase in q
+        for phrase in (
+            "create a react",
+            "create react app",
+            "create-react-app",
+            "react app",
+            "npx create",
+            "npm create",
+            "yarn create",
+            "pnpm create",
+            "new react project",
+            "initialize a react",
+            "vite ",
+            "scaffold ",
+            "bootstrap ",
+        )
+    ):
+        return "structured"
+
     return "exploratory"

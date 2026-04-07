@@ -448,6 +448,40 @@ class IDEState:
         """ReAct subgoal timeline + macro current task (panel below explorer)."""
         return self.timeline_text() + "\n\n" + self.current_task_panel_text()
 
+    def run_events_panel_text(self) -> str:
+        """Status + compact tool trace for inline chat (below assistant message)."""
+        lines = [self.status_bar_text()]
+        tail: list[str] = []
+        for ev in self.trace_events[-8:]:
+            if not isinstance(ev, dict):
+                continue
+            if str(ev.get("phase") or "") != "result":
+                continue
+            tool = ev.get("tool", "?")
+            action = ev.get("action", "?")
+            st = ev.get("status", "?")
+            tail.append(f"{tool}.{action}→{st}")
+        if tail:
+            lines.append("[dim]" + "  ·  ".join(tail[-5:]) + "[/dim]")
+        return "\n".join(lines)
+
+    def composer_chrome_hint(self) -> str:
+        """Bottom composer row (Cursor-style): mode line + shortcuts."""
+        if self.ui_phase == "awaiting_confirm":
+            return (
+                "[yellow]⚠ Awaiting confirmation[/yellow]  "
+                "[dim]Enter send · Shift+Enter newline · Ctrl+P palette[/dim]"
+            )
+        if self.ui_phase == "running":
+            return (
+                "[cyan]● Running…[/cyan]  "
+                "[dim]Agent · Auto  ·  Enter send · Shift+Enter newline · Ctrl+P[/dim]"
+            )
+        return (
+            "[green]✓ Ready[/green]  "
+            "[dim]Agent · Auto  ·  Enter send · Shift+Enter newline · Ctrl+P[/dim]"
+        )
+
     def status_bar_text(self) -> str:
         if self.ui_phase == "awaiting_confirm":
             life = "[bold yellow]⚠ Awaiting confirmation[/bold yellow]"

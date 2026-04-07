@@ -3,7 +3,9 @@ ReAct / answer grounding helpers — strong evidence, goals, relevance, confiden
 """
 from __future__ import annotations
 
+import os
 import re
+from pathlib import Path
 from typing import Any
 
 _TOKEN = re.compile(r"[a-z0-9_]{2,}", re.I)
@@ -139,8 +141,67 @@ def looks_like_repo_exploration_query(query: str) -> bool:
     return False
 
 
+def low_signal_probe_max_steps(settings: Any, workspace_root: str | None) -> int:
+    """
+    Repo exploration probe depth: slightly deeper on larger trees (one shallow walk, capped).
+    """
+    hard = max(1, int(getattr(settings, "REACT_MAX_STEPS_CAP", 7) or 7))
+    base = max(1, int(getattr(settings, "REACT_LOW_SIGNAL_PROBE_MAX_STEPS", 2) or 2))
+    large = max(
+        base,
+        int(getattr(settings, "REACT_LOW_SIGNAL_PROBE_MAX_STEPS_LARGE_REPO", 3) or 3),
+    )
+    threshold = int(getattr(settings, "REACT_PROBE_LARGE_REPO_MIN_FILES", 400) or 400)
+    root = (workspace_root or os.getcwd() or "").strip()
+    if not root:
+        return min(base, hard)
+    n = 0
+    try:
+        rp = Path(root).resolve()
+        if not rp.is_dir():
+            return min(base, hard)
+        for _dirpath, _dirnames, filenames in os.walk(rp, topdown=True):
+            n += len(filenames)
+            if n >= threshold:
+                return min(large, hard)
+        return min(base, hard)
+    except OSError:
+        return min(base, hard)
+
+
+def scaffold_shell_hint(query: str) -> str:
+    """Extra ReAct instruction when the user wants a new project / scaffold (not prose-only)."""
+    q = (query or "").lower()
+    triggers = (
+        "create react",
+        "create-react-app",
+        "create a react",
+        "new react",
+        "react app",
+        "npx create",
+        "npm create",
+        "yarn create",
+        "pnpm create",
+        "vite",
+        "next.js",
+        "nextjs",
+        "scaffold",
+        "initialize a ",
+        "bootstrap a ",
+        "generate a project",
+    )
+    if not any(t in q for t in triggers):
+        return ""
+    return (
+        "Bootstrap / new-project requests: you MUST use shell.run_command with the real CLI "
+        "(e.g. `npx create-react-app my-app` or `npm create vite@latest`) after a quick "
+        "list_dir of the workspace root if needed. Do not answer with only a tutorial — "
+        "execute the commands the user asked for.\n"
+    )
+
+
 def looks_like_task_execution_query(query: str) -> bool:
-    """User wants to run tests, installs, or checks — shell tool may apply (ask mode)."""
+    """User wants to run tests, installs, scaffolds, or checks — shell tool may apply (ask mode)."""
     q = (query or "").lower()
     if len(q) > 400:
         return False
@@ -149,6 +210,14 @@ def looks_like_task_execution_query(query: str) -> bool:
         "npm install",
         "npm run",
         "npm test",
+        "npm create",
+        "yarn create",
+        "pnpm create",
+        "npx ",
+        "create-react-app",
+        "create react",
+        "vite",
+        "next ",
         "yarn ",
         "pnpm ",
         "pip install",
@@ -172,11 +241,49 @@ def looks_like_task_execution_query(query: str) -> bool:
     return any(n in q for n in needles)
 
 
-def is_trivial_query(query: str) -> bool:
+def looks_like_explicit_task_command(query: str) -> bool:
+    """
+    Obvious one-shot dev commands (pytest, pip install, …) — allow looser classifier confidence.
+    """
+    q = (query or "").lower().strip()
+    if not q:
+        return False
+    needles = (
+        "pytest",
+        "python -m pytest",
+        "npm install",
+        "npm test",
+        "npm run",
+        "npm create",
+        "yarn create",
+        "pnpm create",
+        "npx ",
+        "create-react-app",
+        "pip install",
+        "pip3 install",
+        "poetry install",
+        "poetry run",
+        "cargo test",
+        "make test",
+        "tox",
+        "dotnet test",
+        "gradle test",
+        "mvn test",
+        "vite",
+    )
+    return any(n in q for n in needles)
+
+
+def is_trivial_query(query: str, state: dict[str, Any] | None = None) -> bool:
     """
     Very short, non-code queries (e.g. greetings) — skip heavy ReAct / grounding gates.
     Uses word tokens (no substring matches like "git" inside "digital").
+    If the user supplied pasted code or context, never treat as trivial.
     """
+    if state:
+        ctx = str(state.get("user_context") or "").strip()
+        if ctx:
+            return False
     q = (query or "").lower().strip()
     if not q:
         return True
@@ -216,7 +323,7 @@ def has_strong_rag(ranked_ctx: list[Any] | None) -> bool:
 def may_emit_answer(state: dict[str, Any], ranked_ctx: list) -> bool:
     """Write mode, trivial chat, any RAG hits, file/symbol evidence, or strong RAG."""
     q = (state.get("query") or state.get("current_step") or "").strip()
-    if is_trivial_query(q):
+    if is_trivial_query(q, state):
         return True
     if state.get("write_enabled"):
         return True
