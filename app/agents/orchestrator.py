@@ -382,37 +382,22 @@ class AgentOrchestrator:
                         ptr += 1
                         continue
 
-                    agent = AgentRegistry.get(node_name)
-                    state = await agent.run(state)
-
-                    if node_name == "Critic":
-                        from app.agents.critic_executor import apply_critic_action
-                        should_retry = apply_critic_action(state)
-                        
-                        if mode == "build" and state.get("classification", {}).get("confidence", 1.0) < 0.7:
-                            logger.warning("Aborting Build execution writes due to low Confidence evaluations mapped natively!")
-                            state["write_enabled"] = False
-                            
-                        if (state.get("critic_retry") or should_retry) and state["critic_retry_count"] < state["max_retries"]:
-                            logger.warning(
-                                "Critic requested retry (attempt %s).",
-                                state["critic_retry_count"],
-                            )
-                            state["critic_retry_count"] += 1
-                            ptr = 0
-                        else:
-                            ptr += 1
-                    elif node_name == "FileWriteTest":
+                    # Not a registered agent — inline sandbox (must run before AgentRegistry.get)
+                    if node_name == "FileWriteTest":
                         if mode == "build" and state.get("write_enabled"):
                             import re
                             from app.tools.file_write_tool import FileWriteTool
                             from app.tools.test_runner_tool import TestRunnerTool
-                            
+
                             fw_tool = FileWriteTool(repo_path=self._repo_path or ".")
                             allowed_files = list({c["file_path"] for c in state.get("ranked_ctx", [])})
                             answer = state.get("answer", "")
-                            
-                            patch_matches = re.finditer(r"<patch file=['\"]?(.*?)['\"]?>(.*?)</patch>", answer, re.DOTALL)
+
+                            patch_matches = re.finditer(
+                                r"<patch file=['\"]?(.*?)['\"]?>(.*?)</patch>",
+                                answer,
+                                re.DOTALL,
+                            )
                             patches = []
                             diffs = []
                             for match in patch_matches:
@@ -422,41 +407,55 @@ class AgentOrchestrator:
                                 if df:
                                     patches.append({"file_path": fp, "new_content": nc})
                                     diffs.append(df)
-                                    
+
                             if patches:
                                 combined_diff = "\\n\\n".join(diffs)
-                                # Trigger UI explicitly passing execution variables
                                 conf = True
-                                confirm_cb = kwargs.get("confirm_diff_callback") if "kwargs" in locals() else state.get("confirm_diff_callback")
+                                confirm_cb = (
+                                    kwargs.get("confirm_diff_callback")
+                                    if "kwargs" in locals()
+                                    else state.get("confirm_diff_callback")
+                                )
                                 if confirm_cb and not auto_apply and not dry_run:
                                     conf = await confirm_cb(combined_diff)
-                                    
+
                                 if dry_run:
-                                    logger.info("[FileWriteTest] Dry-Run mapped flawlessly avoiding executions!")
+                                    logger.info(
+                                        "[FileWriteTest] Dry-Run mapped flawlessly avoiding executions!"
+                                    )
                                     ptr += 1
                                     continue
-                                
+
                                 if conf:
                                     res = fw_tool.apply_patches(patches, allowed_files)
                                     if res.success:
                                         state["patch_branch"] = res.data.get("branch")
-                                        # Trigger Auto Loop!
-                                        tr_res = TestRunnerTool(self._repo_path or ".").execute_tests()
+                                        tr_res = TestRunnerTool(
+                                            self._repo_path or "."
+                                        ).execute_tests()
                                         if not tr_res.success:
-                                            logger.warning(f"[FileWriteTest] Tests Failed! Routing Critic Retries natively: {tr_res.error[:200]}")
+                                            logger.warning(
+                                                "[FileWriteTest] Tests Failed! Routing Critic Retries natively: %s",
+                                                tr_res.error[:200],
+                                            )
                                             if state["critic_retry_count"] < state["max_retries"]:
                                                 sig = hash(tr_res.error[-500:])
                                                 state["failure_signatures"].append(sig)
                                                 if state["failure_signatures"].count(sig) >= 3:
-                                                    logger.error("Trajectory Halted: Same autonomous failure boundary hit 3 times dynamically natively. Extracted limit.")
+                                                    logger.error(
+                                                        "Trajectory Halted: Same autonomous failure boundary hit 3 times dynamically natively. Extracted limit."
+                                                    )
                                                     state["abort_reason"] = "repeated_failure"
-                                                    state["failure_signature"] = tr_res.error[-500:]
+                                                    state["failure_signature"] = tr_res.error[
+                                                        -500:
+                                                    ]
                                                     break
-                                                    
+
                                                 state["critic_retry"] = True
-                                                state["critic_feedback"] = f"Tests failed mapping patches explicitly: \\n{tr_res.error[-1500:]}\\nPlease fix."
+                                                state["critic_feedback"] = (
+                                                    f"Tests failed mapping patches explicitly: \\n{tr_res.error[-1500:]}\\nPlease fix."
+                                                )
                                                 state["critic_retry_count"] += 1
-                                                # NOTE: V1 preserves the branch automatically without hard resets preventing logic wipes out of debuggability natively!
                                                 ptr = 0
                                                 continue
                                             else:
@@ -464,10 +463,41 @@ class AgentOrchestrator:
                                                 state["abort_reason"] = "max_retries_exceeded"
                                                 state["failure_signature"] = tr_res.error[-500:]
                                     else:
-                                        logger.error(f"[FileWriteTest] Patch execution boundary hit limits natively: {res.error}")
+                                        logger.error(
+                                            "[FileWriteTest] Patch execution boundary hit limits natively: %s",
+                                            res.error,
+                                        )
                                 else:
-                                    logger.info("[FileWriteTest] Patch Discarded structurally bounds User constraints!")
+                                    logger.info(
+                                        "[FileWriteTest] Patch Discarded structurally bounds User constraints!"
+                                    )
                         ptr += 1
+                        continue
+
+                    agent = AgentRegistry.get(node_name)
+                    state = await agent.run(state)
+
+                    if node_name == "Critic":
+                        from app.agents.critic_executor import apply_critic_action
+                        should_retry = apply_critic_action(state)
+
+                        if mode == "build" and state.get("classification", {}).get("confidence", 1.0) < 0.7:
+                            logger.warning(
+                                "Aborting Build execution writes due to low Confidence evaluations mapped natively!"
+                            )
+                            state["write_enabled"] = False
+
+                        if (
+                            state.get("critic_retry") or should_retry
+                        ) and state["critic_retry_count"] < state["max_retries"]:
+                            logger.warning(
+                                "Critic requested retry (attempt %s).",
+                                state["critic_retry_count"],
+                            )
+                            state["critic_retry_count"] += 1
+                            ptr = 0
+                        else:
+                            ptr += 1
                     else:
                         ptr += 1
 

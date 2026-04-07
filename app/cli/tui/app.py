@@ -445,23 +445,44 @@ class DeepCodeTuiApp(App):
         stream_buffer = ""
         import time
         last_update_t = time.perf_counter()
-        
+
+        def _refocus_input() -> None:
+            try:
+                self.query_one("#input", Input).focus()
+            except Exception:
+                pass
+
+        def _apply_answer_markup(markup: str) -> None:
+            answer_widget.update(markup)
+            self._chat_scroll().scroll_end(animate=False)
+
         async def _stream_callback(chunk: str) -> None:
             nonlocal stream_buffer, last_update_t
             stream_buffer += chunk
             if time.perf_counter() - last_update_t > 0.05:
-                answer_widget.update(chatfmt.assistant_label() + "\n" + escape(stream_buffer) + " ▌")
-                self._chat_scroll().scroll_end(animate=False)
+                buf = stream_buffer
+
+                def _push_partial() -> None:
+                    _apply_answer_markup(
+                        chatfmt.assistant_label() + "\n" + escape(buf)
+                    )
+
+                self.call_next(_push_partial)
                 last_update_t = time.perf_counter()
-                
+
         async def _confirm_diff_callback(combined_diff: str) -> bool:
-            # We must use self since self is the App natively!
             return await self.push_screen_wait(ConfirmDiffScreen(diff_text=combined_diff))
 
         async def _status_callback(msg: str) -> None:
-            if not stream_buffer: # Don't overwrite tokens!
-                answer_widget.update(chatfmt.assistant_label() + f"\n[dim italic]{msg}[/dim italic]")
-                self._chat_scroll().scroll_end(animate=False)
+            if not stream_buffer:
+
+                def _push_status() -> None:
+                    _apply_answer_markup(
+                        chatfmt.assistant_label()
+                        + f"\n[dim italic]{escape(msg)}[/dim italic]"
+                    )
+
+                self.call_next(_push_status)
 
         try:
             result = await run_ask_async(
@@ -479,10 +500,11 @@ class DeepCodeTuiApp(App):
         except Exception as exc:
             answer_widget.update(chatfmt.error_block(str(exc)))
             self._chat_scroll().scroll_end(animate=False)
+            self.call_next(_refocus_input)
             return
 
         answer = result.get("answer") or ""
-        answer_widget.update(chatfmt.assistant_label() + "\n" + escape(answer))
+        _apply_answer_markup(chatfmt.assistant_label() + "\n" + escape(answer))
 
         meta = result.get("meta")
         if meta is not None:
@@ -520,13 +542,16 @@ class DeepCodeTuiApp(App):
                 "[bold]Debug trace[/bold]\n" + escape(json.dumps(tr, indent=2, default=str))
             )
 
-        # Test Branch tracking logic seamlessly
-        branch = meta.get("patch_branch") if meta else None
+        branch = (meta or {}).get("patch_branch")
         if branch:
-            self._mount_chat(chatfmt.system_block(f"[bold green]✓ Phase 3 Phase 4 Atomic deployments mapped across branch:[/bold green] {branch}"))
+            self._mount_chat(
+                chatfmt.system_block(
+                    f"Branch: {escape(str(branch))} (patch workflow)"
+                )
+            )
 
         self._chat_scroll().scroll_end(animate=False)
-        self.query_one("#input", Input).focus()
+        self.call_next(_refocus_input)
 
 
 def run_tui(
