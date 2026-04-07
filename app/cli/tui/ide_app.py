@@ -1,11 +1,14 @@
 """
-DeepCode V2 — agent IDE runtime (Textual): chat | editor | explorer + terminal.
+DeepCode V2 — agent IDE runtime (Textual): chat + subgoals (left) | editor + terminal (center) |
+explorer (right). Message input is only as wide as the chat column.
 
 Run: deepcode ui --ide [REPO]
 """
 from __future__ import annotations
 
 import json
+import os
+import socket
 from pathlib import Path
 
 from rich.markup import escape
@@ -55,17 +58,67 @@ class DeepCodeIdeApp(App):
     Screen { layout: vertical; }
     Header { background: $primary 10%; }
     Footer { background: $panel; color: $text-muted; }
-    #ide-top { height: 1fr; layout: horizontal; min-height: 8; }
-    #ide-chat { width: 1fr; height: 1fr; border-right: outer $primary 25%; }
-    #ide-editor-col { width: 2fr; height: 1fr; border-right: outer $primary 25%; }
-    #ide-explorer-col { width: 1fr; height: 1fr; }
+    #ide-top {
+        height: 1fr;
+        layout: horizontal;
+        min-height: 8;
+    }
+    #ide-chat {
+        width: 1fr;
+        height: 1fr;
+        layout: vertical;
+        border-right: outer $primary 25%;
+    }
+    #ide-chat-scroll {
+        height: 2fr;
+        min-height: 6;
+        padding: 0 1;
+    }
+    #ide-center {
+        width: 2fr;
+        height: 1fr;
+        layout: vertical;
+        border-right: outer $primary 25%;
+    }
+    #ide-editor-stack {
+        height: 1fr;
+        min-height: 6;
+        layout: vertical;
+    }
+    #ide-terminal-stack {
+        height: 1fr;
+        min-height: 5;
+        layout: vertical;
+        border-top: outer $primary 30%;
+        padding: 0 1;
+    }
+    #ide-terminal-stack.hidden {
+        display: none;
+        height: 0;
+        min-height: 0;
+        border: none;
+    }
+    #ide-right {
+        width: 1fr;
+        height: 1fr;
+        layout: vertical;
+    }
+    #ide-explorer-col {
+        height: 1fr;
+        min-height: 5;
+        layout: vertical;
+    }
+    #ide-subgoals-scroll {
+        height: 1fr;
+        min-height: 4;
+        padding: 0 1;
+    }
     .ide-panel-title {
         background: $primary 14%;
         text-style: bold;
         padding: 0 1;
         height: 1;
     }
-    #ide-chat-scroll { height: 1fr; padding: 0 1; }
     #ide-editor-path { padding: 0 1; background: $panel; height: 1; }
     #ide-editor-body { height: 1fr; padding: 0 1; }
     #ide-explorer-scroll { height: 1fr; padding: 0 1; }
@@ -74,26 +127,21 @@ class DeepCodeIdeApp(App):
         min-height: 1;
         padding: 0 1;
         background: $warning 8%;
-        border-bottom: solid $primary 20%;
+        border-top: solid $primary 15%;
     }
     #ide-debug-trace {
-        height: 8;
-        min-height: 4;
-        border-top: solid $primary 15%;
+        height: 6;
+        min-height: 3;
         border-bottom: solid $primary 15%;
     }
-    #ide-bottom-dock {
-        height: 10;
-        min-height: 4;
-        border-top: outer $primary 30%;
-        layout: vertical;
-        padding: 0 1;
-    }
-    #ide-bottom-dock.hidden { display: none; height: 0; min-height: 0; border: none; }
     #ide-shell-out { height: 1fr; min-height: 3; }
     #ide-shell-in { height: 1; margin-top: 1; }
     #ide-editor-tabs { height: 1; padding: 0 1; background: $panel 80%; }
-    #input { border: tall $primary 30%; margin: 0 1 1 1; dock: bottom; }
+    #input {
+        border: tall $primary 30%;
+        margin: 0 1 0 1;
+        height: 1;
+    }
     """
 
     def __init__(
@@ -118,31 +166,49 @@ class DeepCodeIdeApp(App):
             with Vertical(id="ide-chat"):
                 yield Static("Chat", classes="ide-panel-title")
                 yield VerticalScroll(id="ide-chat-scroll")
-            with Vertical(id="ide-editor-col"):
-                yield Static("Editor / Diff", classes="ide-panel-title")
-                yield Static("", id="ide-editor-tabs")
-                yield Static("", id="ide-editor-path")
-                yield VerticalScroll(id="ide-editor-body")
-            with Vertical(id="ide-explorer-col"):
-                yield Static("Explorer", classes="ide-panel-title")
-                yield VerticalScroll(id="ide-explorer-scroll")
-        with Vertical(id="ide-bottom-dock"):
-            yield Static("", id="ide-orchestrator-bar")
-            if self._ide_debug:
-                yield Static("Debug trace", classes="ide-panel-title")
-                yield RichLog(
-                    id="ide-debug-trace",
-                    auto_scroll=True,
-                    wrap=True,
-                    markup=True,
+                yield Static(
+                    "Subgoals & current task",
+                    classes="ide-panel-title",
                 )
-            yield Static("Terminal", classes="ide-panel-title")
-            yield RichLog(id="ide-shell-out", auto_scroll=True, wrap=True, markup=True)
-            yield Input(placeholder="Shell command… Enter", id="ide-shell-in")
-        yield Input(
-            placeholder="Message…  Ctrl+P  /ask /edit /run /plan /metrics",
-            id="input",
-        )
+                yield VerticalScroll(id="ide-subgoals-scroll")
+                yield Static("", id="ide-orchestrator-bar")
+                yield Input(
+                    placeholder="Message…  Ctrl+P  /ask /edit /run /plan /metrics",
+                    id="input",
+                )
+            with Vertical(id="ide-center"):
+                with Vertical(id="ide-editor-stack"):
+                    yield Static("Editor / Diff", classes="ide-panel-title")
+                    yield Static("", id="ide-editor-tabs")
+                    yield Static("", id="ide-editor-path")
+                    yield VerticalScroll(id="ide-editor-body")
+                with Vertical(id="ide-terminal-stack"):
+                    if self._ide_debug:
+                        yield Static("Debug trace", classes="ide-panel-title")
+                        yield RichLog(
+                            id="ide-debug-trace",
+                            auto_scroll=True,
+                            wrap=True,
+                            markup=True,
+                        )
+                    yield Static("Terminal", classes="ide-panel-title")
+                    yield RichLog(
+                        id="ide-shell-out",
+                        auto_scroll=True,
+                        wrap=True,
+                        markup=True,
+                    )
+                    yield Input(
+                        placeholder="Shell… Enter",
+                        id="ide-shell-in",
+                    )
+            with Vertical(id="ide-right"):
+                with Vertical(id="ide-explorer-col"):
+                    yield Static(
+                        "Explorer — files & context",
+                        classes="ide-panel-title",
+                    )
+                    yield VerticalScroll(id="ide-explorer-scroll")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -179,9 +245,9 @@ class DeepCodeIdeApp(App):
 
     def action_toggle_bottom_visibility(self) -> None:
         self._flush_ide_events()
-        dock = self.query_one("#ide-bottom-dock", Vertical)
+        term = self.query_one("#ide-terminal-stack", Vertical)
         self._bottom_visible = not self._bottom_visible
-        dock.set_class(not self._bottom_visible, "hidden")
+        term.set_class(not self._bottom_visible, "hidden")
 
     def _flush_ide_events(self) -> None:
         try:
@@ -201,12 +267,14 @@ class DeepCodeIdeApp(App):
 
     def action_copy_explorer(self) -> None:
         block = (
-            self.ide_state.timeline_text()
+            self.ide_state.subgoals_tasks_panel_text()
             + "\n\n"
-            + self.ide_state.explorer_text()
+            + self.ide_state.explorer_panel_text()
         )
         if copy_plain_text(strip_rich_markup(block)):
-            self._mount_chat(chatfmt.system_block("Explorer + timeline copied (plain text)."))
+            self._mount_chat(
+                chatfmt.system_block("Subgoals / task + explorer copied (plain text).")
+            )
         else:
             self._mount_chat(chatfmt.error_block("Clipboard unavailable on this system."))
 
@@ -244,10 +312,15 @@ class DeepCodeIdeApp(App):
                 ex.remove_children()
                 ex.mount(
                     Static(
-                        "[bold]Subgoals[/bold]\n"
-                        + self.ide_state.timeline_text()
-                        + "\n\n"
-                        + self.ide_state.explorer_text(),
+                        self.ide_state.explorer_panel_text(),
+                        classes="chat-line",
+                    )
+                )
+                sg = self.query_one("#ide-subgoals-scroll", VerticalScroll)
+                sg.remove_children()
+                sg.mount(
+                    Static(
+                        self.ide_state.subgoals_tasks_panel_text(),
                         classes="chat-line",
                     )
                 )
@@ -451,7 +524,11 @@ class DeepCodeIdeApp(App):
                 on_line=lambda t: self.call_next(lambda: append_out(t)),
             )
             self._shell_cwd = cwd
-            self.call_next(lambda: append_out(f"[cwd {cwd}]"))
+            u = os.environ.get("USERNAME") or os.environ.get("USER", "user")
+            h = (socket.gethostname() or "host").split(".")[0]
+            leaf = Path(cwd).name or cwd
+            tip = f"{u}@{h}:{leaf}$ "
+            self.call_next(lambda: append_out(tip))
 
         self.call_next(lambda: append_out(f"> {line}"))
         await self._ide_shell.send_line(line)
@@ -529,7 +606,7 @@ class DeepCodeIdeApp(App):
             self._mount_chat(
                 chatfmt.system_block(
                     "IDE: /help /metrics /clear /browse /repo /run /edit /plan …\n"
-                    "Ctrl+P palette  |  Ctrl+B hide/show terminal  |  Ctrl+I tab  |  "
+                    "Ctrl+P palette  |  Ctrl+B hide/show center terminal  |  Ctrl+I tab  |  "
                     "Ctrl+W close tab  |  Ctrl+L clear chat  |  Ctrl+Shift+E/D copy explorer / editor"
                 )
             )

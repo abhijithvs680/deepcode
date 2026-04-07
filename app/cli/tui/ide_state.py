@@ -363,7 +363,25 @@ class IDEState:
             lines.append(f" · {str(x)[:120]}")
         return "\n".join(lines)
 
-    def explorer_text(self) -> str:
+    def current_task_panel_text(self) -> str:
+        """Macro / long-run task line for the tasks column."""
+        ct = self.current_task
+        lines: list[str] = ["[bold]> Current task[/bold]"]
+        if ct.get("description"):
+            tid = ct.get("task_id") or "?"
+            lines.append(
+                f" · [{rich_escape(str(tid))}] "
+                f"{rich_escape(str(ct.get('description', ''))[:220])}"
+            )
+        else:
+            lines.append(" [dim](none)[/dim]")
+        return "\n".join(lines)
+
+    def explorer_panel_text(self) -> str:
+        """
+        Rankings, working set, cross-subgoal — right-hand explorer column
+        (subgoals + current task live under chat on the left).
+        """
         lines: list[str] = []
         ws_set = set(self.working_set)
         ranked = sorted(
@@ -375,16 +393,6 @@ class IDEState:
             key=lambda p: self.file_scores.get(p, 0),
             reverse=True,
         )[:24]
-
-        ct = self.current_task
-        if ct.get("description"):
-            tid = ct.get("task_id") or "?"
-            lines.append("[bold]> Current task[/bold]")
-            lines.append(
-                f" · [{rich_escape(str(tid))}] "
-                f"{rich_escape(str(ct.get('description', ''))[:200])}"
-            )
-            lines.append("")
 
         pf = self.prior_findings_text()
         if pf:
@@ -427,6 +435,18 @@ class IDEState:
             for p in self.touched_files[-10:]:
                 lines.append(f" · {p}")
         return "\n".join(lines)
+
+    def explorer_text(self) -> str:
+        """Full explorer dump (e.g. copy) — task + rankings."""
+        parts: list[str] = []
+        if self.current_task.get("description"):
+            parts.append(self.current_task_panel_text())
+        parts.append(self.explorer_panel_text())
+        return "\n\n".join(parts).strip()
+
+    def subgoals_tasks_panel_text(self) -> str:
+        """Left column: ReAct subgoal timeline + macro current task (panel title in UI)."""
+        return self.timeline_text() + "\n\n" + self.current_task_panel_text()
 
     def status_bar_text(self) -> str:
         if self.ui_phase == "awaiting_confirm":
