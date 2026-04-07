@@ -52,6 +52,109 @@ class ConfirmDiffScreen(ModalScreen[bool]):
         else:
             self.dismiss(False)
 
+
+class ConfirmShellScreen(ModalScreen[str]):
+    """Prompt before running a shell command (Run / Skip / Allowlist)."""
+
+    CSS = """
+    ConfirmShellScreen {
+        align: center middle;
+    }
+    #shell-backdrop {
+        width: 100%;
+        height: 100%;
+        align: center middle;
+        background: $background 70%;
+    }
+    #shell-dialog {
+        width: 88;
+        max-width: 94%;
+        height: auto;
+        max-height: 85%;
+        background: $surface;
+        border: thick $primary;
+        padding: 1 2;
+    }
+    #shell-title {
+        margin-bottom: 1;
+    }
+    #shell-cwd {
+        margin-bottom: 1;
+        color: $text-muted;
+    }
+    #shell-cmd {
+        width: 100%;
+        min-height: 3;
+        padding: 0 1;
+        background: $panel;
+        border: solid $primary 35%;
+    }
+    #shell-buttons {
+        width: 100%;
+        height: auto;
+        margin-top: 1;
+        align: right middle;
+    }
+    """
+
+    BINDINGS = [Binding("escape", "skip", "Skip")]
+
+    def __init__(
+        self,
+        command: str,
+        *,
+        title: str | None = None,
+        tag_labels: list[str] | None = None,
+        cwd_hint: str | None = None,
+    ):
+        super().__init__()
+        self.command = (command or "").strip()
+        self.title_text = (title or "Run shell command").strip() or "Run shell command"
+        self.tag_labels = [str(x) for x in (tag_labels or []) if str(x).strip()][:8]
+        self.cwd_hint = (cwd_hint or "").strip()
+
+    def compose(self) -> ComposeResult:
+        with Container(id="shell-backdrop"):
+            with Vertical(id="shell-dialog"):
+                tags = ", ".join(escape(t) for t in self.tag_labels)
+                title_markup = f"[bold]{escape(self.title_text)}[/bold]"
+                if tags:
+                    title_markup += f"  [dim]{tags}[/dim]"
+                yield Static(title_markup, id="shell-title")
+                if self.cwd_hint:
+                    yield Static(f"cwd: {escape(self.cwd_hint)}", id="shell-cwd")
+                yield Static(f"$ {escape(self.command)}", id="shell-cmd")
+                with Horizontal(id="shell-buttons"):
+                    yield Button("Skip", id="btn_skip", variant="default")
+                    yield Button(self._allowlist_label(), id="btn_allow", variant="default")
+                    yield Button("Run", id="btn_run", variant="primary")
+
+    def _allowlist_label(self) -> str:
+        t = self.tag_labels
+        if not t:
+            return "Allowlist command"
+        if len(t) == 1:
+            return f"Allowlist '{t[0]}'"
+        return f"Allowlist '{t[0]}' + {len(t) - 1}"
+
+    def on_mount(self) -> None:
+        try:
+            self.query_one("#btn_run", Button).focus()
+        except Exception:
+            pass
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn_run":
+            self.dismiss("run")
+        elif event.button.id == "btn_allow":
+            self.dismiss("allowlist_run")
+        else:
+            self.dismiss("skip")
+
+    def action_skip(self) -> None:
+        self.dismiss("skip")
+
+
 from app.cli.commands.ask import run_ask_async, run_long_goal_async
 from app.cli.tui.widgets import chat as chatfmt
 from app.cli.tui.widgets.command_palette import CommandPaletteScreen
@@ -566,6 +669,22 @@ class DeepCodeTuiApp(App):
                 )
             )
 
+        async def _confirm_shell_callback(
+            command: str,
+            *,
+            title: str | None = None,
+            cwd: str | None = None,
+            tag_labels: list[str] | None = None,
+        ) -> str:
+            return await self.push_screen_wait(
+                ConfirmShellScreen(
+                    command=command,
+                    title=title,
+                    tag_labels=tag_labels,
+                    cwd_hint=cwd,
+                )
+            )
+
         async def _status_callback(msg: str) -> None:
             if not stream_buffer:
 
@@ -715,6 +834,7 @@ class DeepCodeTuiApp(App):
                     dry_run=dry_run,
                     stream_callback=_stream_callback,
                     confirm_diff_callback=_confirm_diff_callback,
+                    confirm_shell_callback=_confirm_shell_callback,
                     status_callback=_status_callback,
                     react_cancel_event=self._react_cancel_event,
                 )
@@ -729,6 +849,7 @@ class DeepCodeTuiApp(App):
                     dry_run=dry_run,
                     stream_callback=_stream_callback,
                     confirm_diff_callback=_confirm_diff_callback,
+                    confirm_shell_callback=_confirm_shell_callback,
                     status_callback=_status_callback,
                     react_cancel_event=self._react_cancel_event,
                 )

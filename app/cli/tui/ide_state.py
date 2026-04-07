@@ -56,6 +56,7 @@ class IDEState:
     cross_subgoal_summary: str = ""
     early_stop_reason: str = ""
     last_rag_reason: str = ""
+    orchestrator_status_line: str = ""
 
     # User-closed editor tabs — excluded from working_set / rankings until agent re-opens.
     closed_paths: set[str] = field(default_factory=set)
@@ -151,7 +152,24 @@ class IDEState:
         t = event.get("type")
         if t == "final_answer":
             return
-        if t == "agent_file_open":
+        if t == "fast_path":
+            r = str(event.get("reason") or "trivial_query")
+            q = str(event.get("query") or "")[:160]
+            self.log(f"fast_path ({r}): {q}")
+            self.trace_events.append(
+                {
+                    "phase": "result",
+                    "step": 0,
+                    "group": "main",
+                    "tool": "orchestrator",
+                    "action": "fast_path",
+                    "status": "success",
+                    "summary": r[:72],
+                }
+            )
+            if len(self.trace_events) > self.max_trace_lines:
+                self.trace_events = self.trace_events[-self.max_trace_lines :]
+        elif t == "agent_file_open":
             p = str(event.get("path") or "").replace("\\", "/").strip()
             if p:
                 self.closed_paths.discard(p)
@@ -267,24 +285,29 @@ class IDEState:
         """After run completes — context continuity + ranking."""
         if not meta:
             return
-        ws = [
+        raw_ws = [
             self._norm_path(str(p))
             for p in (meta.get("active_working_set") or [])
-            if p and self._norm_path(str(p)) not in self.closed_paths
+            if p
         ]
-        self.working_set = ws
+        for p in raw_ws:
+            if p:
+                self.closed_paths.discard(p)
+        self.working_set = normalize_paths(raw_ws, MAX_WORKING_SET)
         fs_new: dict[str, float] = {}
         for k, v in (meta.get("file_scores") or {}).items():
             if not k:
                 continue
             nk = self._norm_path(str(k))
-            if nk and nk not in self.closed_paths:
+            if nk:
+                self.closed_paths.discard(nk)
                 fs_new[nk] = float(v)
         self.file_scores = fs_new
         if not self.file_scores:
             for i, p in enumerate(meta.get("react_priority_files") or []):
                 np = self._norm_path(str(p))
-                if np and np not in self.closed_paths:
+                if np:
+                    self.closed_paths.discard(np)
                     self.file_scores[np] = 1.0 - i * 0.1
         self.shared_context = dict(meta.get("shared_context") or {})
         self.global_insights = list(meta.get("global_insights") or [])
@@ -420,13 +443,16 @@ class IDEState:
             cc = f"[yellow]conf={c:.2f}[/yellow]"
         else:
             cc = f"[green]conf={c:.2f}[/green]"
+        ost = ""
+        if self.orchestrator_status_line.strip():
+            ost = f"  [dim]{rich_escape(self.orchestrator_status_line.strip()[:140])}[/dim]"
         if not a:
             es = (
                 f"  [dim]{rich_escape(self.early_stop_reason)}[/dim]"
                 if self.early_stop_reason
                 else ""
             )
-            return f"{life}  {cc}{es}".strip()
+            return f"{life}  {cc}{ost}{es}".strip()
         w = (
             "  [red]⚠ low grounding[/red]"
             if a.get("weak_grounding")
@@ -437,7 +463,7 @@ class IDEState:
             es = f"  [yellow]stop: {rich_escape(self.early_stop_reason)}[/yellow]"
         return (
             f"{life}  {cc}  files={int(a.get('files_read') or 0)}  "
-            f"symbols={int(a.get('symbols') or 0)}{w}{es}"
+            f"symbols={int(a.get('symbols') or 0)}{ost}{w}{es}"
         ).strip()
 
     def timeline_text(self) -> str:

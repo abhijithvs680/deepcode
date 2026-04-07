@@ -65,6 +65,7 @@ _CODEISH_HINTS = frozenset(
         "patch",
         "edit",
         "repo",
+        "git",
         "function",
         "class",
         "import",
@@ -72,21 +73,55 @@ _CODEISH_HINTS = frozenset(
         "exception",
         "test",
         "build",
+        "api",
+        "stack",
+        "trace",
+        "login",
+        "http",
+        "endpoint",
+        "deploy",
+        "merge",
+        "branch",
+        "commit",
+        "database",
+        "sql",
+        "json",
+        "config",
+        "webpack",
+        "npm",
+        "node",
+        "server",
+        "client",
+        "request",
+        "response",
+        "state",
+        "hook",
+        "async",
+        "await",
+        "promise",
     }
 )
 
 
 def is_trivial_query(query: str) -> bool:
     """
-    Short, non-code queries (e.g. greetings) — skip heavy ReAct / grounding gates.
+    Very short, non-code queries (e.g. greetings) — skip heavy ReAct / grounding gates.
+    Uses word tokens (no substring matches like "git" inside "digital").
     """
     q = (query or "").lower().strip()
     if not q:
         return True
     words = q.split()
-    if len(words) > 3:
+    if len(words) > 4:
         return False
-    if any(h in q for h in _CODEISH_HINTS):
+    ts = token_set(q)
+    if ts & _CODEISH_HINTS:
+        return False
+    if re.search(r"\b(500|404|403|401|502)\b", q):
+        return False
+    if "http://" in q or "https://" in q or ".py" in q or "::" in q:
+        return False
+    if "stack trace" in q or "traceback" in q:
         return False
     return True
 

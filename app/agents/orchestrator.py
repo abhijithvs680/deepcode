@@ -353,6 +353,14 @@ class AgentOrchestrator:
             "next_subgoal_bias": [],
             "active_working_set": [],
         }
+        for _cb_key in (
+            "stream_callback",
+            "status_callback",
+            "confirm_diff_callback",
+            "confirm_shell_callback",
+        ):
+            if _cb_key in kwargs:
+                state[_cb_key] = kwargs[_cb_key]
 
         try:
             status_cb = kwargs.get("status_callback") if "kwargs" in locals() else state.get("status_callback")
@@ -410,6 +418,24 @@ class AgentOrchestrator:
                         answer[:2500],
                         state.get("base_query_embed"),
                     )
+                cls_c = float(classification.get("confidence", 0.85) or 0.85)
+                await EventBus.emit(
+                    {
+                        "type": "fast_path",
+                        "reason": "trivial_query",
+                        "query": question[:500],
+                    }
+                )
+                await EventBus.emit(
+                    {
+                        "type": "agent_status",
+                        "confidence": cls_c,
+                        "files_read": 0,
+                        "symbols": 0,
+                        "weak_grounding": False,
+                        "subgoal_id": None,
+                    }
+                )
                 return_dict = {
                     "answer": answer,
                     "session_id": session_id,
@@ -423,7 +449,8 @@ class AgentOrchestrator:
                         "retrieved_files": [],
                         "final_confidence": state["final_confidence"],
                         "classification": classification,
-                        "agent_intent": classification.get("agent_intent"),
+                        "agent_intent": "trivial",
+                        "fast_path": True,
                         "tool_steps_count": 0,
                         "rag_used": False,
                         "rag_reason": "trivial_fast_path",
@@ -521,25 +548,6 @@ class AgentOrchestrator:
                         retriever_ref = AgentRegistry.get("Retriever")
 
                         if self.settings.REACT_AGENT_ENABLED and mode != "plan":
-                            if (
-                                mode == "ask"
-                                and (state.get("classification") or {}).get(
-                                    "agent_intent"
-                                )
-                                == "broad"
-                            ):
-                                logger.info(
-                                    "[Orchestrator] Broad intent ask: skip ReAct, "
-                                    "parallel tool+RAG only"
-                                )
-                                if status_cb:
-                                    await status_cb(
-                                        "Broad query — parallel retrieval (no ReAct)…"
-                                    )
-                                state = await run_parallel_tool_rag(state)
-                                ptr += 1
-                                continue
-
                             from app.agents.reasoning_loop import (
                                 enough_context,
                                 finalize_react_edit_session,

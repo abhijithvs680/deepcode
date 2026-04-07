@@ -104,7 +104,14 @@ _REL_OK = 0.22
 
 
 def _tool_step_useful(res: ToolResult | None, query: str) -> bool:
-    if not res or not res.success or res.data is None:
+    if not res:
+        return False
+    if res.tool == "shell" and (res.action or "").strip() == "run_command":
+        d0 = res.data if isinstance(res.data, dict) else {}
+        if d0.get("skipped"):
+            return False
+        return bool(res.data)
+    if not res.success or res.data is None:
         return False
     d = res.data
     if not isinstance(d, dict):
@@ -184,6 +191,16 @@ def _tool_step_useful(res: ToolResult | None, query: str) -> bool:
 def _step_result_summary(res: ToolResult | None) -> str:
     if not res:
         return "no result"
+    if res.tool == "shell" and (res.action or "").strip() == "run_command":
+        d = res.data if isinstance(res.data, dict) else {}
+        ec = d.get("exit_code")
+        lo = len(str(d.get("stdout") or ""))
+        le = len(str(d.get("stderr") or ""))
+        bits = f"exit={ec} stdout={lo}b stderr={le}b"
+        if not res.success:
+            err = (res.error or "failed")[:80]
+            return f"{bits} ({err})"
+        return bits
     if not res.success:
         return (res.error or "failed")[:120]
     if not res.data or not isinstance(res.data, dict):
@@ -440,8 +457,8 @@ _REACT_SYSTEM_NO_EDIT = """You are a coding agent step planner. Reply with ONE J
 Schema:
 {
   "thought": "short reasoning",
-  "tool": "file" | "git" | "log" | null,
-  "action": "read_file" | "search" | "list_dir" | "find_symbol" | "get_symbols" | "get_file_dependencies" | "get_symbol_dependencies" | "done" | "git_log" | "git_blame" | "search_logs" | "get_recent_failures",
+  "tool": "file" | "git" | "log" | "shell" | null,
+  "action": "read_file" | "search" | "list_dir" | "find_symbol" | "get_symbols" | "get_file_dependencies" | "get_symbol_dependencies" | "run_command" | "done" | "git_log" | "git_blame" | "search_logs" | "get_recent_failures",
   "args": { },
   "done": false
 }
@@ -453,6 +470,7 @@ Rules:
 - get_file_dependencies: args {"path": "app/foo.py", "limit": 30} — import graph (indexed repo + DB)
 - get_symbol_dependencies: args {"name": "SymbolName", "limit": 20} — symbol → file + import neighborhood
 - search: args {"query": "snippet"} or {"queries": ["a","b"]}
+- shell.run_command: args {"command": "single-line shell string", "cwd": "optional relative dir", "title": "optional short label"} — requires user approval in UI; use for checks like tests or syntax (not for destructive ops without explicit user intent).
 - git_log: args {} or {"file_path": "optional", "n": 10}
 - Set tool null, action "done", done true when further tools are unnecessary.
 """
@@ -461,8 +479,8 @@ _REACT_SYSTEM_WITH_EDIT = """You are a coding agent step planner. Reply with ONE
 Schema:
 {
   "thought": "short reasoning",
-  "tool": "file" | "file_edit" | "git" | "log" | null,
-  "action": "read_file" | "search" | "list_dir" | "find_symbol" | "get_symbols" | "get_file_dependencies" | "get_symbol_dependencies" | "apply_search_replace" | "checkpoint_session" | "commit_session" | "rollback_session" | "done" | "git_log" | "git_blame" | "search_logs" | "get_recent_failures",
+  "tool": "file" | "file_edit" | "git" | "log" | "shell" | null,
+  "action": "read_file" | "search" | "list_dir" | "find_symbol" | "get_symbols" | "get_file_dependencies" | "get_symbol_dependencies" | "apply_search_replace" | "checkpoint_session" | "commit_session" | "rollback_session" | "run_command" | "done" | "git_log" | "git_blame" | "search_logs" | "get_recent_failures",
   "args": { },
   "done": false
 }
@@ -480,6 +498,7 @@ Rules:
 - file_edit.checkpoint_session: args {} — save in-session edit state (used on subgoal failure to keep last good checkpoint).
 - file_edit.commit_session: args {"allowed_files":["app/x.py",...]} — force early persist (optional).
 - file_edit.rollback_session: args {} — discard uncommitted in-session edits.
+- shell.run_command: args {"command": "single-line shell string", "cwd": "optional relative dir", "title": "optional short label"} — requires user approval in UI.
 - git_log: args {} or {"file_path": "optional", "n": 10}
 - Set tool null, action "done", done true when further tools are unnecessary.
 """
@@ -565,7 +584,7 @@ async def run_reasoning_loop(
     intent = (state.get("classification") or {}).get("agent_intent", "exploratory")
     if intent == "broad":
         state["react_force_rag"] = True
-        max_steps = min(max_steps, 2)
+        max_steps = min(max_steps, 1)
 
     q = state.get("current_step") or state.get("query") or ""
     router = state.get("selected_tool")
@@ -584,6 +603,7 @@ async def run_reasoning_loop(
         "git_blame": 2,
         "search_logs": 2,
         "get_recent_failures": 2,
+        "run_command": 3,
     }
     if cls_loop < 0.4:
         _ACTION_SOFT_LIMITS["list_dir"] = max(_ACTION_SOFT_LIMITS["list_dir"], 4)
@@ -807,9 +827,9 @@ async def run_reasoning_loop(
             args_preview=json.dumps(args, default=str) if args else None,
         )
 
-        valid_tools = ("file", "git", "log")
+        valid_tools = ("file", "git", "log", "shell")
         if _edit_tool_enabled(state):
-            valid_tools = ("file", "file_edit", "git", "log")
+            valid_tools = ("file", "file_edit", "git", "log", "shell")
         if tool_name not in valid_tools:
             state["react_observations"].append(
                 f"Step {i}: invalid tool {tool_name!r} — stopping."
@@ -947,8 +967,11 @@ async def run_reasoning_loop(
 
         res: ToolResult | None
         t0 = time.perf_counter()
+        exec_args = dict(args)
+        if tool_name == "shell":
+            exec_args["confirm_shell_callback"] = state.get("confirm_shell_callback")
         try:
-            res = await registry.execute_tool(tool_name, action, **args)
+            res = await registry.execute_tool(tool_name, action, **exec_args)
         except Exception as exc:
             res = None
             state["react_observations"].append(f"Step {i}: tool error {exc}")

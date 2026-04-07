@@ -47,9 +47,19 @@ class ExecutionPlanner(BaseAgent):
             
         from app.agents.query_expander import expand_query
         from app.agents.tool_router import resolve_tool_routing
+
         queries = expand_query(question)
-        tool_name, tool_conf = await resolve_tool_routing(question, queries, self._provider)
-        
+        if len(queries) > 1:
+            sys_prompt += f"\n\nQuery expansion hints: {queries[:5]!r}"
+
+        routing = await resolve_tool_routing(
+            question,
+            self._provider,
+            adaptive_config=state.get("adaptive_config"),
+        )
+        tool_name = routing.get("selected_tool")
+        tool_conf = float(routing.get("confidence") or 0.0)
+
         if tool_name and tool_conf > 0.6:
             sys_prompt += f"\n\nSystem Tool Target Preference:\nThe orchestrator predicts '{tool_name}' is required to satisfy this request (Confidence: {tool_conf}). Bias step 1 natively utilizing this route gracefully!"
             
