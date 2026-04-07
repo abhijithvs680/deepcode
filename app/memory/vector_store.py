@@ -29,8 +29,17 @@ async def insert_chunks(
                 embedding = await provider.embed(chunk["content"])
                 clean_content = chunk["content"].replace("\x00", "")
                 ev = None
-                if embedding and len(embedding) == _settings.EMBEDDING_DIMENSION:
-                    ev = embedding
+                if embedding:
+                    if len(embedding) == _settings.EMBEDDING_DIMENSION:
+                        ev = embedding
+                    else:
+                        logger.warning(
+                            "Embedding length %d != EMBEDDING_DIMENSION %d — "
+                            "pgvector column skipped; set EMBEDDING_DIMENSION to %d and re-init DB.",
+                            len(embedding),
+                            _settings.EMBEDDING_DIMENSION,
+                            len(embedding),
+                        )
 
                 row = CodeChunk(
                     id=uuid.uuid4(),

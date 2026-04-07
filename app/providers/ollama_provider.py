@@ -26,7 +26,8 @@ class OllamaProvider(LLMProvider):
         self.base_url = (base_url or settings.OLLAMA_BASE_URL).rstrip("/")
         self.model = model or settings.LLM_MODEL
         self.embedding_model = embedding_model or settings.EMBEDDING_MODEL
-        self._timeout = httpx.Timeout(120.0, connect=10.0)
+        to = float(getattr(settings, "OLLAMA_HTTP_TIMEOUT_S", 300.0))
+        self._timeout = httpx.Timeout(to, connect=10.0)
 
     # ── LLMProvider interface ─────────────────────────────────────────────
     async def generate(
@@ -123,7 +124,15 @@ class OllamaProvider(LLMProvider):
                 response = await client.post(url, json=payload)
                 response.raise_for_status()
                 data = response.json()
-                return data.get("embedding", [])
+                if "embedding" in data:
+                    return data["embedding"] or []
+                # Newer Ollama /api/embed style: { "embeddings": [[...]] }
+                embs = data.get("embeddings")
+                if isinstance(embs, list) and embs:
+                    first = embs[0]
+                    if isinstance(first, list):
+                        return first
+                return []
         except httpx.ConnectError as exc:
             logger.error("Cannot reach Ollama at %s: %s", self.base_url, exc)
             raise ConnectionError(

@@ -37,10 +37,13 @@ class Settings(BaseSettings):
 
     # ── Ollama ────────────────────────────────────────────────────────────
     OLLAMA_BASE_URL: str = "http://localhost:11434"
+    # Large local models (e.g. 26B+) often exceed 120s on cold load + first token.
+    OLLAMA_HTTP_TIMEOUT_S: float = 300.0
 
     # ── Embedding ─────────────────────────────────────────────────────────
     EMBEDDING_MODEL: str = "qwen3-embedding:8b"
-    EMBEDDING_DIMENSION: int = 768
+    # Ollama's qwen3-embedding:8b returns 4096 floats by default (Matryoshka-capable; we use full dim).
+    EMBEDDING_DIMENSION: int = 4096
 
     # ── RAG / code intelligence ───────────────────────────────────────────
     MAX_CONTEXT_TOKENS: int = 6000

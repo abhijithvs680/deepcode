@@ -248,7 +248,15 @@ async def search(
     cap = settings.RAG_CANDIDATE_CAP
 
     if use_ann:
-        rows = await _ann_candidates(repo_name, qemb, cap)
+        try:
+            rows = await _ann_candidates(repo_name, qemb, cap)
+        except Exception as exc:
+            # e.g. query vector dim ≠ column dim after changing EMBEDDING_MODEL / DIMENSION
+            logger.warning(
+                "pgvector ANN query failed (%s); falling back to full chunk load + JSON embeddings.",
+                exc,
+            )
+            rows = await _load_chunks(repo_name)
     else:
         rows = await _load_chunks(repo_name)
 

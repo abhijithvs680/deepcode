@@ -14,6 +14,7 @@ class TestSettings:
         assert s.OLLAMA_BASE_URL == "http://localhost:11434"
         assert s.LLM_TEMPERATURE == 0.7
         assert s.LLM_MAX_TOKENS == 2048
+        assert s.EMBEDDING_DIMENSION == 4096
 
     def test_cached_settings(self):
         s1 = get_settings()

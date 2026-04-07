@@ -7,6 +7,7 @@ import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 
 from app.agents.orchestrator import AgentOrchestrator
+from app.core.config import get_settings
 
 
 class TestOrchestratorWithoutDB:
@@ -28,7 +29,8 @@ class TestOrchestratorWithoutDB:
         """Run should work without DB — just no logging."""
         mock_provider = MagicMock()
         mock_provider.generate = AsyncMock(return_value="Test answer")
-        mock_provider.embed = AsyncMock(return_value=[0.1] * 768)
+        dim = get_settings().EMBEDDING_DIMENSION
+        mock_provider.embed = AsyncMock(return_value=[0.1] * dim)
         mock_get_provider.return_value = mock_provider
 
         orchestrator = AgentOrchestrator()
@@ -47,7 +49,8 @@ class TestOrchestratorWithDB:
         """Run with user context should include it in the prompt."""
         mock_provider = MagicMock()
         mock_provider.generate = AsyncMock(return_value="Answer with context")
-        mock_provider.embed = AsyncMock(return_value=[0.1] * 768)
+        dim = get_settings().EMBEDDING_DIMENSION
+        mock_provider.embed = AsyncMock(return_value=[0.1] * dim)
         mock_get_provider.return_value = mock_provider
 
         orchestrator = AgentOrchestrator()
@@ -67,7 +70,8 @@ class TestOrchestratorWithDB:
         """Errors from the provider should propagate up."""
         mock_provider = MagicMock()
         mock_provider.generate = AsyncMock(side_effect=ConnectionError("Ollama down"))
-        mock_provider.embed = AsyncMock(return_value=[0.1] * 768)
+        dim = get_settings().EMBEDDING_DIMENSION
+        mock_provider.embed = AsyncMock(return_value=[0.1] * dim)
         mock_get_provider.return_value = mock_provider
 
         orchestrator = AgentOrchestrator()
