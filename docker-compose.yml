@@ -12,10 +12,10 @@ services:
       # Uses asyncpg driver — must match our SQLAlchemy engine
       - DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/deepcode
       - LLM_PROVIDER=ollama
-      - LLM_MODEL=gemma4:26b
+      - LLM_MODEL=deepseek-coder-v2:16b-lite-instruct-q4_K_M
       - OLLAMA_BASE_URL=http://host.docker.internal:11434
-      - EMBEDDING_MODEL=qwen3-embedding:8b
-      - EMBEDDING_DIMENSION=4096
+      - EMBEDDING_MODEL=nomic-embed-text:latest
+      - EMBEDDING_DIMENSION=768
       - LOG_LEVEL=INFO
     volumes:
       - .:/app

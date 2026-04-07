@@ -1,8 +1,8 @@
 """
 Ollama LLM provider implementation.
 
-Uses /api/chat (not /api/generate) so reasoning models like Gemma 4 return text in
-`message.content` when native thinking is off. See ollama/ollama#15288.
+Uses /api/chat (not /api/generate) so `message.content` is populated for most instruct models
+when `think` is false. Some reasoning-only stacks put text in `thinking` — see _text_from_chat_response.
 """
 import json
 
@@ -80,7 +80,7 @@ class OllamaProvider(LLMProvider):
         temperature: float | None = None,
         **kwargs,
     ) -> str:
-        """Chat completion via /api/chat (compatible with Gemma 4 + thinking models)."""
+        """Chat completion via /api/chat (works with DeepSeek, Llama, Qwen, etc.)."""
         url = f"{self.base_url}/api/chat"
         target_model = model or self.model
         payload: dict = {
@@ -206,8 +206,9 @@ class OllamaProvider(LLMProvider):
 
     async def embed(self, text: str) -> list[float]:
         """
-        Embedding via Ollama. Prefer /api/embed (current API); fall back to /api/embeddings.
-        Many models (e.g. qwen3-embedding) 500 on deprecated /api/embeddings on newer Ollama.
+        Embedding via Ollama. Prefer /api/embed; fall back to /api/embeddings.
+        Matryoshka models can use EMBEDDING_OLLAMA_PASS_DIMENSIONS + EMBEDDING_DIMENSION;
+        fixed-size models (e.g. nomic-embed-text) should leave that flag False.
         """
         raw = (text or "").replace("\x00", "")
         if not raw.strip():
@@ -230,13 +231,19 @@ class OllamaProvider(LLMProvider):
             async with httpx.AsyncClient(timeout=self._timeout) as client:
                 attempts: list[tuple[str, dict]] = []
 
-                # Modern endpoint + optional Matryoshka dimensions
                 base_embed: dict = {
                     "model": model,
                     "input": raw,
                     "truncate": True,
                 }
-                if isinstance(dim, int) and dim > 0:
+                use_dim_param = bool(
+                    getattr(settings, "EMBEDDING_OLLAMA_PASS_DIMENSIONS", False)
+                )
+                if (
+                    use_dim_param
+                    and isinstance(dim, int)
+                    and dim > 0
+                ):
                     attempts.append(
                         ("/api/embed", {**base_embed, "dimensions": dim})
                     )
@@ -260,6 +267,18 @@ class OllamaProvider(LLMProvider):
                             continue
                         vec = self._parse_embedding_body(r.json())
                         if vec:
+                            if (
+                                isinstance(dim, int)
+                                and dim > 0
+                                and len(vec) != dim
+                            ):
+                                logger.warning(
+                                    "Ollama embed vector len=%d != EMBEDDING_DIMENSION=%d "
+                                    "(model=%s); fix model or dimension setting.",
+                                    len(vec),
+                                    dim,
+                                    model,
+                                )
                             return vec
                         last_err = f"{path} returned empty embedding"
                         logger.warning("Ollama %s", last_err)

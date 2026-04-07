@@ -30,8 +30,8 @@ class Settings(BaseSettings):
 
     # ── LLM Provider ─────────────────────────────────────────────────────
     LLM_PROVIDER: str = "ollama"  # "ollama" | "openai" | "anthropic"
-    LLM_MODEL: str = "gemma4:26b"
-    LLM_ROUTER_MODEL: str = "gemma4:26b" # Configured for fast low-latency tasks
+    LLM_MODEL: str = "deepseek-coder-v2:16b-lite-instruct-q4_K_M"
+    LLM_ROUTER_MODEL: str = "deepseek-coder-v2:16b-lite-instruct-q4_K_M"
     LLM_TEMPERATURE: float = 0.7
     LLM_MAX_TOKENS: int = 2048
 
@@ -39,13 +39,16 @@ class Settings(BaseSettings):
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     # Large local models (e.g. 26B+) often exceed 120s on cold load + first token.
     OLLAMA_HTTP_TIMEOUT_S: float = 300.0
-    # Ollama /api/chat "think" flag. Gemma 4 / Qwen-style models need False or `message.content` stays empty.
+    # Ollama /api/chat "think" flag. Set True only if your model requires native "thinking" output.
     OLLAMA_NATIVE_THINKING: bool = False
 
     # ── Embedding ─────────────────────────────────────────────────────────
-    EMBEDDING_MODEL: str = "qwen3-embedding:8b"
-    # Ollama's qwen3-embedding:8b returns 4096 floats by default (Matryoshka-capable; we use full dim).
-    EMBEDDING_DIMENSION: int = 4096
+    EMBEDDING_MODEL: str = "nomic-embed-text:latest"
+    # Must match Ollama embedding vector length (nomic-embed-text → 768).
+    EMBEDDING_DIMENSION: int = 768
+    # If True, pass "dimensions" to Ollama /api/embed (Matryoshka models, e.g. qwen3-embedding).
+    # Leave False for nomic-embed-text and other fixed-size models.
+    EMBEDDING_OLLAMA_PASS_DIMENSIONS: bool = False
 
     # ── RAG / code intelligence ───────────────────────────────────────────
     MAX_CONTEXT_TOKENS: int = 6000
