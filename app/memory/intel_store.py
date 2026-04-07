@@ -355,6 +355,34 @@ async def fetch_git_context_text(
     return "\n\n".join(parts)
 
 
+async def lookup_repo_symbols(
+    db: AsyncSession,
+    repo_name: str,
+    name_substring: str,
+    *,
+    limit: int = 25,
+) -> list[dict]:
+    """
+    SQL lookup of ingested symbols (no embeddings). Used by FileTool.find_symbol / ReAct loop.
+    """
+    if not repo_name or not (name_substring or "").strip():
+        return []
+    from app.models.repo_intel import RepoSymbol
+
+    pat = f"%{name_substring.strip()}%"
+    stmt = (
+        select(RepoSymbol)
+        .where(RepoSymbol.repo_name == repo_name)
+        .where(RepoSymbol.symbol.ilike(pat))
+        .limit(limit)
+    )
+    rows = (await db.execute(stmt)).scalars().all()
+    return [
+        {"symbol": r.symbol, "file": r.file_path, "kind": r.kind}
+        for r in rows
+    ]
+
+
 # ── Long-Term Cognition (Week 5) ─────────────────────────────────────────────
 
 async def store_decision(db: AsyncSession, repo_name: str, symbol: str, context: str) -> None:

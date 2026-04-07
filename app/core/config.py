@@ -87,6 +87,10 @@ class Settings(BaseSettings):
     # Orchestrator DAG safety cap (critic retries reset the workflow pointer)
     ORCHESTRATOR_MAX_ITERATIONS: int = 16
 
+    # ReAct-style tool-first exploration (RAG only when context is insufficient)
+    REACT_AGENT_ENABLED: bool = True
+    REACT_MAX_STEPS: int = 5
+
 
 @lru_cache()
 def get_settings() -> Settings:

@@ -5,6 +5,7 @@ Routes user queries through the appropriate provider and returns the result.
 Integrates ContextBuilder, composite RAG + Git scoring, optional LLM rerank, interaction logging.
 """
 import asyncio
+import os
 import time
 import uuid
 
@@ -19,6 +20,19 @@ from app.providers.factory import get_provider
 
 logger = get_logger(__name__)
 settings = get_settings()
+
+
+def _workspace_root_for_repo(repo_id: str | None) -> str:
+    if repo_id:
+        try:
+            from app.core.repo_registry import get_repo_entry
+
+            entry = get_repo_entry(repo_id)
+            if entry and entry.get("path"):
+                return str(entry["path"])
+        except Exception:
+            pass
+    return os.getcwd()
 
 
 class AgentOrchestrator:
@@ -101,6 +115,9 @@ class AgentOrchestrator:
 
         # Resolve classification bounds synchronously
         classification = await classification_task
+        from app.agents.agent_intent import derive_agent_intent
+
+        classification["agent_intent"] = derive_agent_intent(classification, question)
         q_conf = classification.get("confidence", 1.0)
         q_type = classification.get("query_type", "factual") if q_conf >= 0.6 else "factual"
         disable_aggressive_overrides = q_conf < 0.6
@@ -281,9 +298,12 @@ class AgentOrchestrator:
 
         # Core DAG: planner → parallel tool+RAG → answer → critic → file_write_test
         workflow = ["Planner", "ParallelRetrieval", "Answer", "Critic", "FileWriteTest"]
+        ws_root = _workspace_root_for_repo(repo_id)
+        self._repo_path = ws_root
         state = {
             "query": question,
             "repo_id": repo_id,
+            "workspace_root": ws_root,
             "trace": trace,
             "embed_cache": {},
             "fallbacks_local": [],
@@ -298,6 +318,14 @@ class AgentOrchestrator:
             "write_enabled": mode == "build",
             "auto_apply": auto_apply,
             "dry_run": dry_run,
+            "rag_used": False,
+            "rag_reason": "",
+            "react_steps": [],
+            "react_observations": [],
+            "files_read": [],
+            "symbols_found": [],
+            "react_force_rag": False,
+            "react_priority_files": [],
         }
 
         try:
@@ -359,27 +387,144 @@ class AgentOrchestrator:
                         elif node_name == "FileWriteTest": await status_cb("🛠 Applying patches & evaluating Autonomous Sandboxes...")
                     
                     if node_name == "ParallelRetrieval":
+                        retriever_ref = AgentRegistry.get("Retriever")
+
+                        if self.settings.REACT_AGENT_ENABLED and mode != "plan":
+                            from app.agents.reasoning_loop import (
+                                enough_context,
+                                run_reasoning_loop,
+                            )
+                            from app.tools.registry import ToolRegistry
+
+                            if status_cb:
+                                await status_cb(
+                                    "Exploring codebase (tool-first ReAct)…"
+                                )
+                            reg = ToolRegistry(
+                                state.get("workspace_root") or os.getcwd(),
+                                db=self._db,
+                                repo_name=repo_id,
+                            )
+                            state = await run_reasoning_loop(
+                                state,
+                                self._provider,
+                                reg,
+                                max_steps=self.settings.REACT_MAX_STEPS,
+                            )
+
+                            rc = float(state.get("router_confidence") or 0.0)
+                            tool_conf_high = rc > 0.90
+                            rag_bypass_types = {"git"}
+                            force_no_rag = state.get("force_tool") or (
+                                tool_conf_high and q_type in rag_bypass_types
+                            )
+
+                            if force_no_rag:
+                                state["ranked_ctx"] = []
+                                state["rag_used"] = False
+                                state["rag_reason"] = (
+                                    "git_or_forced_tool_high_confidence_skip_rag"
+                                )
+                                fl = list(state.get("fallbacks_local") or [])
+                                if "rag_skipped_git_bypass" not in fl:
+                                    fl.append("rag_skipped_git_bypass")
+                                state["fallbacks_local"] = fl
+                            elif state.get("react_force_rag"):
+                                state["rag_used"] = True
+                                state["rag_reason"] = "no_progress_after_react_tools"
+                                try:
+                                    state = await asyncio.wait_for(
+                                        retriever_ref.run(dict(state)),
+                                        timeout=self.settings.RAG_RETRIEVAL_TIMEOUT_S,
+                                    )
+                                except asyncio.TimeoutError:
+                                    logger.warning(
+                                        "Retriever exceeded timeout after ReAct (force_rag)."
+                                    )
+                                    state["ranked_ctx"] = []
+                                    fl = list(state.get("fallbacks_local") or [])
+                                    fl.append("rag_timeout")
+                                    state["fallbacks_local"] = fl
+                                except Exception as ex:
+                                    logger.warning(
+                                        "Retriever failed after ReAct (force_rag): %s",
+                                        ex,
+                                    )
+                                    state["ranked_ctx"] = []
+                            elif enough_context(state):
+                                state.setdefault("ranked_ctx", [])
+                                state["rag_used"] = False
+                                state["rag_reason"] = "enough_context_after_react"
+                            else:
+                                state["rag_used"] = True
+                                state["rag_reason"] = (
+                                    "insufficient_grounding_after_react"
+                                )
+                                try:
+                                    state = await asyncio.wait_for(
+                                        retriever_ref.run(dict(state)),
+                                        timeout=self.settings.RAG_RETRIEVAL_TIMEOUT_S,
+                                    )
+                                except asyncio.TimeoutError:
+                                    logger.warning(
+                                        "Retriever exceeded timeout after ReAct."
+                                    )
+                                    state["ranked_ctx"] = []
+                                    fl = list(state.get("fallbacks_local") or [])
+                                    fl.append("rag_timeout")
+                                    state["fallbacks_local"] = fl
+                                except Exception as ex:
+                                    logger.warning(
+                                        "Retriever failed after ReAct: %s", ex
+                                    )
+                                    state["ranked_ctx"] = []
+
+                            if trace:
+                                trace.react_tool_steps_count = len(
+                                    state.get("react_steps") or []
+                                )
+                                trace.rag_used = bool(state.get("rag_used"))
+                                trace.rag_reason = str(
+                                    state.get("rag_reason") or ""
+                                )
+                                trace.react_files_touched = list(
+                                    state.get("files_read") or []
+                                )
+                                trace.react_symbols_used = list(
+                                    state.get("symbols_found") or []
+                                )
+
+                            retriever_ref.apply_hybrid_postprocess(state)
+                            ptr += 1
+                            continue
+
+                        # Legacy: parallel one-shot tool + RAG (or plan mode)
                         rc = float(state.get("router_confidence") or 0.0)
                         tool_conf_high = rc > 0.90
-                        # Phase 5: Bypass RAG only when a deterministic tool is sufficient.
-                        # Do not bypass "navigation": the router often picks `file`, and
-                        # FileTool.search uses the raw query as a literal grep — natural
-                        # language questions then skip RAG and return empty matches.
                         rag_bypass_types = {"git"}
-                        if state.get("force_tool") or (tool_conf_high and q_type in rag_bypass_types):
-                            logger.info(f"[Orchestrator] Bypass Phase 5 rules matched (tool_conf={rc}, type={q_type}). Tracing exclusively over Tool execution limits!")
+                        if state.get("force_tool") or (
+                            tool_conf_high and q_type in rag_bypass_types
+                        ):
+                            logger.info(
+                                "[Orchestrator] Bypass Phase 5 rules matched (tool_conf=%s, type=%s).",
+                                rc,
+                                q_type,
+                            )
                             try:
                                 agent = AgentRegistry.get("ToolExecutor")
                             except KeyError:
                                 agent = AgentRegistry.get("ToolExecutionAgent")
                             try:
-                                state = await asyncio.wait_for(agent.run(state), timeout=self.settings.TOOL_EXEC_TIMEOUT_S)
+                                state = await asyncio.wait_for(
+                                    agent.run(state),
+                                    timeout=self.settings.TOOL_EXEC_TIMEOUT_S,
+                                )
                             except asyncio.TimeoutError:
                                 state["tool_results"] = []
                             state["ranked_ctx"] = []
                             ptr += 1
                             continue
-                            
+
                         state = await run_parallel_tool_rag(state)
                         ptr += 1
                         continue
@@ -567,8 +712,20 @@ class AgentOrchestrator:
                     "retry_count": state.get("critic_retry_count", 0),
                     "adaptive_config": state.get("adaptive_config"),
                     "classification": state.get("classification"),
+                    "agent_intent": (state.get("classification") or {}).get(
+                        "agent_intent"
+                    ),
                     "early_cancel_rag": state.get("early_cancel_rag", False),
                     "early_cancel_tool": state.get("early_cancel_tool", False),
+                    "tool_steps_count": len(state.get("react_steps") or []),
+                    "rag_used": bool(state.get("rag_used")),
+                    "rag_reason": state.get("rag_reason") or "",
+                    "files_touched": list(state.get("files_read") or []),
+                    "symbols_used": list(state.get("symbols_found") or []),
+                    "react_force_rag": bool(state.get("react_force_rag")),
+                    "react_useful_steps": int(state.get("react_useful_steps") or 0),
+                    "react_failed_steps": int(state.get("react_failed_steps") or 0),
+                    "react_priority_files": list(state.get("react_priority_files") or []),
                 },
             }
             if trace:

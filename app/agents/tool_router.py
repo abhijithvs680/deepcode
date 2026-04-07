@@ -6,6 +6,13 @@ from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
+_ROUTER_CONFIDENCE_CAP = 0.85
+
+
+def _cap_router_confidence(c: float) -> float:
+    """Avoid over-trusting the LLM router (prevents RAG starvation / brittle tool lock-in)."""
+    return min(float(c), _ROUTER_CONFIDENCE_CAP)
+
 
 def _heuristic_tool(query: str) -> Optional[str]:
     q = query.lower()
@@ -32,7 +39,7 @@ async def resolve_tool_routing(
         logger.info(f"[ToolRouter] Critic override tool: '{critic_suggested}'")
         return {
             "selected_tool": critic_suggested,
-            "confidence": 1.0,
+            "confidence": _cap_router_confidence(1.0),
             "source": "critic",
         }
 
@@ -67,7 +74,7 @@ async def resolve_tool_routing(
             h = _heuristic_tool(query)
             return {
                 "selected_tool": h,
-                "confidence": 0.55 if h else 0.0,
+                "confidence": _cap_router_confidence(0.55 if h else 0.0),
                 "source": "heuristic",
             }
 
@@ -79,7 +86,9 @@ async def resolve_tool_routing(
             threshold = float(adaptive_config.get("router_confidence_threshold", 0.6))
             boost = adaptive_config.get("tool_boost") or {}
             if isinstance(tool_val, str) and tool_val in boost:
-                confidence = min(1.0, confidence + float(boost.get(tool_val, 0.0)))
+                confidence = confidence + float(boost.get(tool_val, 0.0))
+
+        confidence = _cap_router_confidence(confidence)
 
         if confidence < threshold:
             logger.info(
@@ -97,7 +106,7 @@ async def resolve_tool_routing(
     h = _heuristic_tool(query)
     return {
         "selected_tool": h,
-        "confidence": 0.55 if h else 0.0,
+        "confidence": _cap_router_confidence(0.55 if h else 0.0),
         "source": "heuristic",
     }
 

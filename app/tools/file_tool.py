@@ -1,10 +1,17 @@
 import os
-from typing import Optional, Any
+from typing import Optional, Any, TYPE_CHECKING
 import logging
 
 from app.tools.base_tool import Tool, ToolResult
 
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
+
 logger = logging.getLogger(__name__)
+
+# Cap directory listings to keep prompts bounded
+_LIST_DIR_MAX_ENTRIES = 200
+
 
 class FileTool(Tool):
     """
@@ -13,9 +20,16 @@ class FileTool(Tool):
     """
     name = "file"
     description = "Retrieves live programmatic code state securely restricted over token caps."
-    
-    def __init__(self, workspace_root: str):
+
+    def __init__(
+        self,
+        workspace_root: str,
+        db: Optional["AsyncSession"] = None,
+        repo_name: Optional[str] = None,
+    ):
         self.workspace_root = workspace_root
+        self._db = db
+        self._repo_name = repo_name
 
     async def execute(self, action: str, **kwargs) -> ToolResult:
         """Main routing execution layer safely dispatching boundaries."""
@@ -26,6 +40,10 @@ class FileTool(Tool):
                 return await self.search(**kwargs)
             elif action == "get_symbols":
                 return await self.get_symbols(**kwargs)
+            elif action == "list_dir":
+                return await self.list_dir(**kwargs)
+            elif action == "find_symbol":
+                return await self.find_symbol(**kwargs)
             else:
                 return ToolResult(tool=self.name, action=action, success=False, error=f"Unknown Tool Action: '{action}'")
         except Exception as e:
@@ -175,3 +193,88 @@ class FileTool(Tool):
             )
         except Exception as e:
             return ToolResult(tool=self.name, action="get_symbols", success=False, error=str(e))
+
+    async def list_dir(
+        self,
+        path: str = ".",
+        depth: int = 2,
+        max_entries: int = _LIST_DIR_MAX_ENTRIES,
+    ) -> ToolResult:
+        """List files and directories under a workspace-relative path (bounded)."""
+        try:
+            depth = max(1, min(int(depth or 2), 4))
+            max_entries = max(10, min(int(max_entries or _LIST_DIR_MAX_ENTRIES), 400))
+            base = self._resolve_path(path or ".")
+            if not os.path.isdir(base):
+                return ToolResult(
+                    tool=self.name,
+                    action="list_dir",
+                    success=False,
+                    error="Not a directory.",
+                )
+            root_abs = os.path.abspath(self.workspace_root)
+            entries: list[dict[str, Any]] = []
+            base_depth = base.count(os.sep)
+
+            for current, dirnames, filenames in os.walk(base):
+                cur_depth = current.count(os.sep) - base_depth
+                if cur_depth >= depth:
+                    dirnames[:] = []
+                    continue
+                rel = os.path.relpath(current, self.workspace_root)
+                if rel == ".":
+                    rel = ""
+                for d in sorted(dirnames)[:50]:
+                    rp = os.path.join(rel, d) if rel else d
+                    entries.append({"path": rp.replace("\\", "/"), "type": "dir"})
+                    if len(entries) >= max_entries:
+                        break
+                for f in sorted(filenames)[:80]:
+                    rp = os.path.join(rel, f) if rel else f
+                    entries.append({"path": rp.replace("\\", "/"), "type": "file"})
+                    if len(entries) >= max_entries:
+                        break
+                if len(entries) >= max_entries:
+                    break
+
+            return ToolResult(
+                tool=self.name,
+                action="list_dir",
+                success=True,
+                data={"entries": entries, "root": path or "."},
+                metadata={
+                    "count": len(entries),
+                    "truncated": len(entries) >= max_entries,
+                    "depth": depth,
+                },
+            )
+        except Exception as e:
+            return ToolResult(tool=self.name, action="list_dir", success=False, error=str(e))
+
+    async def find_symbol(self, name: str, limit: int = 25) -> ToolResult:
+        """Resolve symbol names via ingested repo_symbols table (no embeddings)."""
+        if not self._db or not self._repo_name:
+            return ToolResult(
+                tool=self.name,
+                action="find_symbol",
+                success=False,
+                error="Symbol index unavailable (need DB session + indexed repo_id).",
+            )
+        try:
+            from app.memory.intel_store import lookup_repo_symbols
+
+            matches = await lookup_repo_symbols(
+                self._db,
+                self._repo_name,
+                name,
+                limit=min(max(1, int(limit or 25)), 50),
+            )
+            return ToolResult(
+                tool=self.name,
+                action="find_symbol",
+                success=True,
+                data={"matches": matches},
+                metadata={"count": len(matches)},
+            )
+        except Exception as e:
+            return ToolResult(tool=self.name, action="find_symbol", success=False, error=str(e))

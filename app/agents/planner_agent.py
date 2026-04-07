@@ -10,6 +10,10 @@ from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
+# Require this to bind a concrete tool hint (below → explore with ReAct / RAG, no narrow router lock-in).
+_ROUTER_BIND_CONFIDENCE = 0.7
+
+
 class PlannerAgent(BaseAgent):
     """
     Orchestration front-runner. 
@@ -85,19 +89,39 @@ class PlannerAgent(BaseAgent):
         state["router_confidence"] = float(routing.get("confidence", 0.0))
         state["router_source"] = routing.get("source", "none")
 
+        intent = (state.get("classification") or {}).get("agent_intent", "exploratory")
+        bind_tool = bool(
+            needed_tool
+            and state["router_confidence"] > _ROUTER_BIND_CONFIDENCE
+            and intent == "structured"
+        )
         state["tool_routing"] = {
-            "selected_tool": needed_tool,
+            "selected_tool": needed_tool if bind_tool else None,
+            "routed_candidate": needed_tool,
             "confidence": state["router_confidence"],
             "source": state["router_source"],
+            "bind_threshold": _ROUTER_BIND_CONFIDENCE,
+            "bound": bind_tool,
+            "agent_intent": intent,
         }
         if trace:
             trace.tool_routing = state["tool_routing"]
 
-        if needed_tool:
-            logger.info(f"[{self.name}] Tool routing → '{needed_tool}' (conf={state['router_confidence']})")
+        if needed_tool and bind_tool:
+            logger.info(
+                f"[{self.name}] Tool routing → '{needed_tool}' (conf={state['router_confidence']})"
+            )
             state["selected_tool"] = needed_tool
             queries.insert(0, f"TOOL_EXEC:{needed_tool}")
         else:
+            if needed_tool and not bind_tool:
+                logger.info(
+                    "[%s] Router candidate %r not bound (conf=%.2f, intent=%s); explore-first.",
+                    self.name,
+                    needed_tool,
+                    state["router_confidence"],
+                    intent,
+                )
             state["selected_tool"] = None
 
         # Commit back to state graph for Retriever

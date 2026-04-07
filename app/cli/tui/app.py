@@ -162,8 +162,24 @@ class DeepCodeTuiApp(App):
     ]
 
     CSS = """
+    /* Swiss / neo-grotesque feel: clean structure; monospace comes from the terminal. */
     Screen {
         layout: vertical;
+    }
+    Header {
+        text-style: bold;
+        background: $primary 12%;
+        color: $text;
+    }
+    Footer {
+        background: $panel;
+        color: $text-muted;
+    }
+    Input {
+        border: tall $primary 35%;
+    }
+    Static.chat-line {
+        text-style: none;
     }
     #main-row {
         height: 1fr;
@@ -314,6 +330,8 @@ class DeepCodeTuiApp(App):
         return w
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
+        if getattr(self, "_orchestrator_busy", False):
+            return
         if event.input.id != "input":
             return
         raw = event.value.strip()
@@ -484,6 +502,66 @@ class DeepCodeTuiApp(App):
 
                 self.call_next(_push_status)
 
+        from app.core.event_bus import EventBus
+
+        react_lines: list[str] = []
+
+        async def _on_react_event(event: dict) -> None:
+            t = event.get("type")
+            touched = False
+            if t == "react_session_start":
+                react_lines.append(
+                    f"── ReAct ({event.get('intent', '?')}) "
+                    f"max_steps={event.get('max_steps')} ──"
+                )
+                touched = True
+            elif t == "react_step_start":
+                react_lines.append(
+                    f"[Step {int(event.get('step', 0)) + 1}] "
+                    f"{event.get('tool')}.{event.get('action')}"
+                )
+                touched = True
+            elif t == "react_step_result":
+                ok = event.get("success")
+                sym = "→" if ok else "✗"
+                react_lines.append(f"  {sym} {escape(str(event.get('summary', '')))}")
+                touched = True
+            elif t == "react_enough_context":
+                react_lines.append("  (grounding sufficient — ending exploration)")
+                touched = True
+            elif t == "react_done":
+                react_lines.append("  (planner signaled done)")
+                touched = True
+            elif t == "react_session_end":
+                react_lines.append(
+                    f"── End ReAct useful={event.get('useful_steps')} "
+                    f"failed={event.get('failed_steps')} "
+                    f"force_rag={event.get('force_rag')} ──"
+                )
+                touched = True
+            elif t == "react_llm_error":
+                react_lines.append(f"  (LLM step error: {escape(str(event.get('error', '')))})")
+                touched = True
+
+            if not touched:
+                return
+
+            def _push_react() -> None:
+                body = "\n".join(react_lines[-18:])
+                _apply_answer_markup(
+                    chatfmt.assistant_label() + "\n[dim]" + body + "[/dim]"
+                )
+
+            self.call_next(_push_react)
+
+        self._orchestrator_busy = True
+        try:
+            inp_widget = self.query_one("#input", Input)
+            inp_widget.disabled = True
+        except Exception:
+            inp_widget = None
+
+        EventBus.subscribe(_on_react_event)
         try:
             result = await run_ask_async(
                 question,
@@ -500,8 +578,20 @@ class DeepCodeTuiApp(App):
         except Exception as exc:
             answer_widget.update(chatfmt.error_block(str(exc)))
             self._chat_scroll().scroll_end(animate=False)
-            self.call_next(_refocus_input)
             return
+        finally:
+            EventBus.unsubscribe(_on_react_event)
+            self._orchestrator_busy = False
+
+            def _unlock_input() -> None:
+                try:
+                    w = self.query_one("#input", Input)
+                    w.disabled = False
+                    w.focus()
+                except Exception:
+                    pass
+
+            self.call_next(_unlock_input)
 
         answer = result.get("answer") or ""
         _apply_answer_markup(chatfmt.assistant_label() + "\n" + escape(answer))
@@ -511,6 +601,9 @@ class DeepCodeTuiApp(App):
             classification = meta.get("classification") or {}
             q_type = classification.get("query_type", "factual")
             q_conf = classification.get("confidence", 1.0)
+            agent_intent = meta.get("agent_intent") or classification.get(
+                "agent_intent", "—"
+            )
 
             tool_name = meta.get('selected_tool') or 'Pure RAG'
             tool_conf = float(meta.get('router_confidence') or 0.0)
@@ -527,6 +620,7 @@ class DeepCodeTuiApp(App):
 
             markup = (
                 f"🧠 [bold]Query Type:[/bold] {q_type} ({q_conf:.2f})\n"
+                f"🎯 [bold]Agent intent:[/bold] {escape(str(agent_intent))}\n"
                 f"⚙️ [bold]Strategy:[/bold]\n"
                 f"  - rag_top_k: {adap_before} -> {adap_k}\n"
                 f"  - git_bias: {git_bias_str}\n"

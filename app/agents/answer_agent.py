@@ -17,6 +17,58 @@ from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
+
+def _filter_tool_results_by_priority(
+    tool_results: list[dict[str, Any]],
+    priority_files: list[str],
+) -> list[dict[str, Any]]:
+    """Keep git/log + focused file tools; drop noisy list_dir and off-priority search hits."""
+    if not priority_files or not tool_results:
+        return tool_results
+    pf = {p.replace("\\", "/") for p in priority_files}
+
+    def path_in_priority(path: str) -> bool:
+        n = path.replace("\\", "/")
+        if n in pf:
+            return True
+        return any(n.startswith(pref + "/") for pref in pf)
+
+    def touches(tr: dict[str, Any]) -> bool:
+        t = tr.get("tool")
+        if t in ("git", "log"):
+            return True
+        if t != "file":
+            return True
+        data = tr.get("data") or {}
+        if not isinstance(data, dict):
+            return True
+        action = tr.get("action")
+        if action in ("read_file", "get_symbols"):
+            return True
+        if action == "list_dir":
+            return False
+        if action == "search":
+            for m in data.get("matches") or []:
+                if not isinstance(m, dict):
+                    continue
+                fp = m.get("file") or m.get("file_path")
+                if isinstance(fp, str) and path_in_priority(fp):
+                    return True
+            return False
+        if action == "find_symbol":
+            for m in data.get("matches") or []:
+                if not isinstance(m, dict):
+                    continue
+                fp = m.get("file")
+                if isinstance(fp, str) and path_in_priority(fp):
+                    return True
+            return False
+        return True
+
+    out = [tr for tr in tool_results if touches(tr)]
+    return out if out else tool_results
+
+
 class AnswerAgent(BaseAgent):
     """
     Downstream Node responsible for assembling the prompt context variables
@@ -45,7 +97,32 @@ class AnswerAgent(BaseAgent):
         
         identifiers = extract_query_identifiers(question)
         ctx_files = {c["file_path"].replace("\\", "/") for c in ranked_ctx[:18]}
-        tool_results = state.get("tool_results", [])
+        tool_results_raw = state.get("tool_results", [])
+        priority_files = state.get("react_priority_files") or []
+
+        if (
+            state.get("react_steps")
+            and not (state.get("files_read") or [])
+            and not (state.get("symbols_found") or [])
+            and not ranked_ctx
+            and not memories
+            and not tool_results_raw
+            and not state.get("write_enabled")
+            and state.get("mode", "ask") == "ask"
+        ):
+            msg = "Not enough information in the provided context."
+            state["answer"] = msg
+            state["latency_ms"] = 0.0
+            state["full_prompt"] = ""
+            state["context"] = ""
+            state["pieces_used"] = []
+            logger.info("[%s] Hard grounding gate: no files/symbols/RAG/tools", self.name)
+            return state
+
+        tool_results = _filter_tool_results_by_priority(
+            tool_results_raw,
+            priority_files,
+        )
         
         sym_text = ""
         git_slice = ""
@@ -88,6 +165,50 @@ class AnswerAgent(BaseAgent):
             logger.info(f"[{self.name}] Long-term memory context injected (priority=10)")
             
         import json
+
+        react_steps = state.get("react_steps") or []
+        react_observations = state.get("react_observations") or []
+        if react_steps or react_observations or (state.get("react_summary") or "").strip():
+            react_payload = {
+                "steps": react_steps[-10:],
+                "observations": react_observations[-16:],
+            }
+            rs = (state.get("react_summary") or "").strip()
+            if rs:
+                react_payload["earlier_summary"] = rs[:800]
+            if priority_files:
+                react_payload["priority_files"] = priority_files[:2]
+            react_text = truncate_to_token_budget(
+                json.dumps(react_payload, indent=2, default=str),
+                max_tokens=min(2048, self.settings.CONTEXT_BUDGET_TOOL + 512),
+            )
+            builder.add_context(
+                "ReAct exploration (read before answering)",
+                react_text,
+                priority=92,
+            )
+            logger.info(
+                "[%s] ReAct trace injected (steps=%s, obs=%s)",
+                self.name,
+                len(react_steps),
+                len(react_observations),
+            )
+
+        grounding = (
+            "GROUNDING (mandatory): Base your answer ONLY on ReAct exploration, "
+            "Tool Execution Results, Code intelligence / retrieved snippets, and "
+            "Cognitive Memory when present. Do not invent repository paths, symbols, "
+            "or behavior not supported by that evidence.\n"
+            "If the supplied context is insufficient to answer reliably, reply with "
+            "exactly this sentence and nothing else as the answer body: "
+            "Not enough information in the provided context."
+        )
+        if state.get("write_enabled"):
+            grounding += (
+                "\nException for write mode: you may propose <patch> blocks only for "
+                "file paths that appear in the evidence above."
+            )
+        builder.add_context("Grounding contract", grounding, priority=96)
 
         if tool_results:
             tool_payload = truncate_to_token_budget(
@@ -162,7 +283,7 @@ class AnswerAgent(BaseAgent):
             state["latency_ms"] = latency_ms
 
             max_tool_score = 0.0
-            for tr_dict in tool_results:
+            for tr_dict in tool_results_raw:
                 try:
                     max_tool_score = max(
                         max_tool_score, score_tool_result(ToolResult(**tr_dict))

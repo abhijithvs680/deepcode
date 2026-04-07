@@ -29,3 +29,9 @@ class DebugTrace(BaseModel):
     memory_expansion: list[dict[str, Any]] = Field(default_factory=list)
     memory_autolog: list[dict[str, Any]] = Field(default_factory=list)
     tool_routing: dict[str, Any] = Field(default_factory=dict)
+    # ReAct / tool-first observability
+    react_tool_steps_count: int = 0
+    rag_used: bool = False
+    rag_reason: str = ""
+    react_files_touched: list[str] = Field(default_factory=list)
+    react_symbols_used: list[str] = Field(default_factory=list)
