@@ -379,8 +379,8 @@ class IDEState:
 
     def explorer_panel_text(self) -> str:
         """
-        Rankings, working set, cross-subgoal — right-hand explorer column
-        (subgoals + current task live under chat on the left).
+        Rankings, working set, cross-subgoal — upper part of the right column
+        (subgoals + current task sit below this in the IDE layout).
         """
         lines: list[str] = []
         ws_set = set(self.working_set)
@@ -445,7 +445,7 @@ class IDEState:
         return "\n\n".join(parts).strip()
 
     def subgoals_tasks_panel_text(self) -> str:
-        """Left column: ReAct subgoal timeline + macro current task (panel title in UI)."""
+        """ReAct subgoal timeline + macro current task (panel below explorer)."""
         return self.timeline_text() + "\n\n" + self.current_task_panel_text()
 
     def status_bar_text(self) -> str:

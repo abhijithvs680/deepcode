@@ -1,6 +1,6 @@
 """
-DeepCode V2 — agent IDE runtime (Textual): chat + subgoals (left) | editor + terminal (center) |
-explorer (right). Message input is only as wide as the chat column.
+DeepCode V2 — agent IDE runtime (Textual): chat (left) | editor + terminal (center) |
+explorer + subgoals (right). Message input stays within the chat column.
 
 Run: deepcode ui --ide [REPO]
 """
@@ -12,7 +12,7 @@ import socket
 from pathlib import Path
 
 from rich.markup import escape
-from textual import work
+from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -22,7 +22,7 @@ from app.cli.commands.ask import run_ask_async, run_long_goal_async
 from app.cli.tui.app import ConfirmDiffScreen, ConfirmShellScreen, IngestionLoaderScreen
 from app.cli.tui.clipboard_util import copy_plain_text, strip_rich_markup
 from app.cli.tui.ide_event_buffer import IdeEventDebouncer
-from app.cli.tui.ide_shell import IdeSubprocessShell, format_shell_line
+from app.cli.tui.ide_shell import IdeSubprocessShell, ShellPromptLine, format_shell_line
 from app.cli.tui.ide_state import IDEState
 from app.cli.tui.widgets import chat as chatfmt
 from app.cli.tui.widgets.command_palette import CommandPaletteScreen
@@ -76,6 +76,12 @@ class DeepCodeIdeApp(App):
         Binding("ctrl+p", "command_palette", "Commands", show=True),
         Binding("ctrl+l", "clear_chat", "Clear chat", show=True),
         Binding("ctrl+b", "toggle_bottom_visibility", "Terminal", show=True),
+        Binding(
+            "ctrl+shift+t",
+            "focus_shell_prompt",
+            "Shell",
+            show=True,
+        ),
         Binding("ctrl+i", "next_tab", "Next tab", show=True),
         Binding("ctrl+w", "close_tab", "Close tab", show=True),
         Binding("ctrl+shift+e", "copy_explorer", "Copy explorer", show=False),
@@ -105,8 +111,8 @@ class DeepCodeIdeApp(App):
         border-right: outer $primary 25%;
     }
     #ide-chat-scroll {
-        height: 2fr;
-        min-height: 6;
+        height: 1fr;
+        min-height: 8;
         padding: 0 1;
     }
     #ide-center {
@@ -145,8 +151,9 @@ class DeepCodeIdeApp(App):
     }
     #ide-subgoals-scroll {
         height: 1fr;
-        min-height: 4;
+        min-height: 5;
         padding: 0 1;
+        border-top: solid $primary 22%;
     }
     .ide-panel-title {
         background: $primary 14%;
@@ -156,7 +163,11 @@ class DeepCodeIdeApp(App):
     }
     #ide-editor-path { padding: 0 1; background: $panel; height: 1; }
     #ide-editor-body { height: 1fr; padding: 0 1; }
-    #ide-explorer-scroll { height: 1fr; padding: 0 1; }
+    #ide-explorer-scroll {
+        height: 2fr;
+        min-height: 5;
+        padding: 0 1;
+    }
     #ide-orchestrator-bar {
         height: auto;
         min-height: 1;
@@ -170,12 +181,16 @@ class DeepCodeIdeApp(App):
         border-bottom: solid $primary 15%;
     }
     #ide-shell-out { height: 1fr; min-height: 3; }
-    #ide-shell-in { height: 1; margin-top: 1; }
     #ide-editor-tabs { height: 1; padding: 0 1; background: $panel 80%; }
     #input {
-        border: tall $primary 30%;
-        margin: 0 1 0 1;
+        background: #2d2d30;
+        color: #d4d4d4;
+        border: solid #007acc;
+        margin: 0 1 1 1;
         height: 1;
+    }
+    #input:focus {
+        border: solid #1b8ce8;
     }
     """
 
@@ -201,11 +216,6 @@ class DeepCodeIdeApp(App):
             with Vertical(id="ide-chat"):
                 yield Static("Chat", classes="ide-panel-title")
                 yield VerticalScroll(id="ide-chat-scroll")
-                yield Static(
-                    "Subgoals & current task",
-                    classes="ide-panel-title",
-                )
-                yield VerticalScroll(id="ide-subgoals-scroll")
                 yield Static("", id="ide-orchestrator-bar")
                 yield Input(
                     placeholder="Message…  Ctrl+P  /ask /edit /run /plan /metrics",
@@ -233,9 +243,9 @@ class DeepCodeIdeApp(App):
                         wrap=True,
                         markup=True,
                     )
-                    yield Input(
-                        placeholder="Shell… Enter",
-                        id="ide-shell-in",
+                    yield ShellPromptLine(
+                        tip_fn=lambda: self._ide_shell_prompt_tip(),
+                        id="ide-shell-prompt",
                     )
             with Vertical(id="ide-right"):
                 with Vertical(id="ide-explorer-col"):
@@ -244,11 +254,26 @@ class DeepCodeIdeApp(App):
                         classes="ide-panel-title",
                     )
                     yield VerticalScroll(id="ide-explorer-scroll")
+                    yield Static(
+                        "Subgoals & current task",
+                        classes="ide-panel-title",
+                    )
+                    yield VerticalScroll(id="ide-subgoals-scroll")
         yield Footer()
 
     def on_mount(self) -> None:
         self._ev_debounce.bind_app(self)
         self.query_one("#input", Input).focus()
+        try:
+            self.query_one("#ide-shell-out", RichLog).can_focus = False
+            if self._ide_debug:
+                self.query_one("#ide-debug-trace", RichLog).can_focus = False
+        except Exception:
+            pass
+        try:
+            self.query_one("#ide-shell-prompt", ShellPromptLine).refresh_tip()
+        except Exception:
+            pass
         self.push_screen(IngestionLoaderScreen(self.raw_repo_input))
 
     def on_unmount(self) -> None:
@@ -270,6 +295,10 @@ class DeepCodeIdeApp(App):
         self._dispose_shell_worker()
         self._mount_chat(chatfmt.ingest_ready_banner())
         self._refresh_all_panels()
+        try:
+            self.query_one("#ide-shell-prompt", ShellPromptLine).refresh_tip()
+        except Exception:
+            pass
 
     @work(exclusive=True, group="shell_reset")
     async def _dispose_shell_worker(self) -> None:
@@ -283,6 +312,24 @@ class DeepCodeIdeApp(App):
         term = self.query_one("#ide-terminal-stack", Vertical)
         self._bottom_visible = not self._bottom_visible
         term.set_class(not self._bottom_visible, "hidden")
+
+    def action_focus_shell_prompt(self) -> None:
+        self._flush_ide_events()
+        if not self._bottom_visible:
+            self.action_toggle_bottom_visibility()
+        try:
+            sp = self.query_one("#ide-shell-prompt", ShellPromptLine)
+            sp.refresh_tip()
+            sp.focus()
+        except Exception:
+            pass
+
+    def _ide_shell_prompt_tip(self) -> str:
+        cwd = self._repo_path or str(Path.cwd().resolve())
+        u = os.environ.get("USERNAME") or os.environ.get("USER", "user")
+        h = (socket.gethostname() or "host").split(".")[0]
+        leaf = Path(cwd).name or cwd
+        return f"{u}@{h}:{leaf}$ "
 
     def _flush_ide_events(self) -> None:
         try:
@@ -575,14 +622,21 @@ class DeepCodeIdeApp(App):
 
         self.call_next(lambda: append_out(f"> {line}"))
         await self._ide_shell.send_line(line)
+        self.call_next(self._refresh_shell_prompt_tip)
+
+    def _refresh_shell_prompt_tip(self) -> None:
+        try:
+            self.query_one("#ide-shell-prompt", ShellPromptLine).refresh_tip()
+        except Exception:
+            pass
+
+    @on(ShellPromptLine.CommandSubmitted)
+    def _on_shell_prompt_command(self, event: ShellPromptLine.CommandSubmitted) -> None:
+        raw = (event.line or "").strip()
+        if raw:
+            self._run_shell_command(raw)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        if event.input.id == "ide-shell-in":
-            raw = event.value.strip()
-            event.input.value = ""
-            if raw:
-                self._run_shell_command(raw)
-            return
         if getattr(self, "_orchestrator_busy", False):
             return
         if event.input.id != "input":
@@ -649,8 +703,9 @@ class DeepCodeIdeApp(App):
             self._mount_chat(
                 chatfmt.system_block(
                     "IDE: /help /metrics /clear /browse /repo /run /edit /plan …\n"
-                    "Ctrl+P palette  |  Ctrl+B hide/show center terminal  |  Ctrl+I tab  |  "
-                    "Ctrl+W close tab  |  Ctrl+L clear chat  |  Ctrl+Shift+E/D copy explorer / editor"
+                    "Ctrl+P palette  |  Ctrl+B terminal panel  |  Ctrl+Shift+T shell prompt  |  "
+                    "Ctrl+I tab  |  Ctrl+W close tab  |  Ctrl+L clear chat  |  "
+                    "Ctrl+Shift+E/D copy explorer / editor"
                 )
             )
             return
