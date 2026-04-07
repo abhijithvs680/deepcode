@@ -16,7 +16,7 @@ from app.cli.tui.ide_event_buffer import normalize_paths
 MAX_OPEN_FILES = 24
 MAX_WORKING_SET = 16
 MAX_TOUCHED = 32
-MAX_TABS = 14
+MAX_TABS = 8
 
 
 def _stars(score: float, *, max_stars: int = 4) -> str:
@@ -57,16 +57,19 @@ class IDEState:
     early_stop_reason: str = ""
     last_rag_reason: str = ""
 
-    trace_tool_lines: list[str] = field(default_factory=list)
+    trace_events: list[dict[str, Any]] = field(default_factory=list)
     max_trace_lines: int = 120
 
     terminal_log: list[str] = field(default_factory=list)
-    max_terminal_lines: int = 400
+    max_terminal_lines: int = 500
 
-    def log(self, line: str) -> None:
+    def log(self, line: str) -> bool:
+        """Append a terminal line; returns True if oldest lines were dropped."""
         self.terminal_log.append(line)
         if len(self.terminal_log) > self.max_terminal_lines:
             self.terminal_log = self.terminal_log[-self.max_terminal_lines :]
+            return True
+        return False
 
     def _sync_working_into_open(self) -> None:
         merged = normalize_paths(
@@ -76,10 +79,15 @@ class IDEState:
 
     def _sync_tabs(self) -> None:
         self._sync_working_into_open()
-        tab_order = [t for t in self.tabs if t in self.open_files]
+        # MRU: open_files is newest-first; cap tabs without stale tab-only order.
+        tab_order: list[str] = []
+        seen: set[str] = set()
         for p in self.open_files:
-            if p not in tab_order:
-                tab_order.append(p)
+            pn = str(p).replace("\\", "/").strip()
+            if not pn or pn in seen:
+                continue
+            seen.add(pn)
+            tab_order.append(pn)
         self.tabs = tab_order[:MAX_TABS]
         if not self.tabs:
             self.active_tab_index = 0
@@ -95,7 +103,6 @@ class IDEState:
         self.working_set = normalize_paths(self.working_set, MAX_WORKING_SET)
         self.open_files = normalize_paths(self.open_files, MAX_OPEN_FILES)
         self.touched_files = normalize_paths(self.touched_files, MAX_TOUCHED)
-        self.tabs = normalize_paths(self.tabs, MAX_TABS)
         self._sync_tabs()
 
     def next_tab(self) -> None:
@@ -104,6 +111,18 @@ class IDEState:
         self.active_tab_index = (self.active_tab_index + 1) % len(self.tabs)
         self.active_file = self.tabs[self.active_tab_index]
         self.diff_mode = bool(self.pending_diff.get(self.active_file))
+
+    def close_active_tab(self) -> None:
+        """Close the current editor tab (drops file from open list + working set)."""
+        if not self.tabs:
+            return
+        af = self.tabs[self.active_tab_index]
+        for lst in (self.open_files, self.working_set):
+            while af in lst:
+                lst.remove(af)
+        self.pending_diff.pop(af, None)
+        self._normalize_all_paths()
+        self.diff_mode = bool(self.pending_diff.get(self.active_file or ""))
 
     def apply_event(self, event: dict[str, Any]) -> None:
         t = event.get("type")
@@ -188,10 +207,18 @@ class IDEState:
             action = event.get("action") or "?"
             st = event.get("status") or "?"
             summ = (event.get("summary") or "")[:80]
-            line = f"{tool}.{action} → {st} {summ}".strip()
-            self.trace_tool_lines.append(line)
-            if len(self.trace_tool_lines) > self.max_trace_lines:
-                self.trace_tool_lines = self.trace_tool_lines[-self.max_trace_lines :]
+            row: dict[str, Any] = {
+                "tool": str(tool),
+                "action": str(action),
+                "status": str(st),
+                "summary": str(summ).strip(),
+            }
+            ms = event.get("duration_ms")
+            if ms is not None:
+                row["duration_ms"] = ms
+            self.trace_events.append(row)
+            if len(self.trace_events) > self.max_trace_lines:
+                self.trace_events = self.trace_events[-self.max_trace_lines :]
 
     def apply_meta(self, meta: dict[str, Any]) -> None:
         """After run completes — context continuity + ranking."""
@@ -359,9 +386,17 @@ class IDEState:
         if self.last_rag_reason:
             parts.append(f"last_rag: {self.last_rag_reason}\n")
         parts.append("\n[bold]Tool sequence[/bold]\n")
-        if not self.trace_tool_lines:
+        if not self.trace_events:
             parts.append("[dim](no steps yet)[/dim]")
         else:
-            for ln in self.trace_tool_lines[-40:]:
-                parts.append(f" · {ln}")
+            for ev in self.trace_events[-40:]:
+                tool = ev.get("tool", "?")
+                action = ev.get("action", "?")
+                st = ev.get("status", "?")
+                sm = (ev.get("summary") or "")[:72]
+                ms = ev.get("duration_ms")
+                suf = f" ({ms}ms)" if ms is not None else ""
+                parts.append(
+                    f" · [cyan]{tool}[/cyan].{action} → {st}{suf} {sm}\n"
+                )
         return "".join(parts)

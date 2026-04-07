@@ -11,6 +11,7 @@ import uuid
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agents.confirm_diff_util import invoke_confirm_diff_callback
 from app.agents.context_builder import ContextBuilder
 from app.core.config import get_settings
 from app.core.interaction_logger import InteractionLogger
@@ -986,6 +987,27 @@ class AgentOrchestrator:
                             state["require_user_confirm"] = bool(force_confirm)
                             state["require_edit_confirmation"] = force_confirm
 
+                            _confirm_reasons: list[str] = []
+                            if post_answer_conf < 0.6:
+                                _confirm_reasons.append(
+                                    f"Low answer confidence ({post_answer_conf:.2f})"
+                                )
+                            if cls_c < 0.6:
+                                _confirm_reasons.append(
+                                    f"Low classification confidence ({cls_c:.2f})"
+                                )
+                            if bool(state.get("require_user_confirm")) and (
+                                post_answer_conf >= 0.6 and cls_c >= 0.6
+                            ):
+                                _confirm_reasons.append(
+                                    "Explicit confirmation requested "
+                                    "(require_user_confirm)"
+                                )
+                            if force_confirm and not _confirm_reasons:
+                                _confirm_reasons.append(
+                                    "Safety / policy confirmation required"
+                                )
+
                             confirm_cb = (
                                 kwargs.get("confirm_diff_callback")
                                 if "kwargs" in locals()
@@ -1096,7 +1118,13 @@ class AgentOrchestrator:
                                         and (not auto_apply or force_confirm)
                                         and not dry_run
                                     ):
-                                        conf = await confirm_cb(combined_diff)
+                                        conf = await invoke_confirm_diff_callback(
+                                            confirm_cb,
+                                            combined_diff,
+                                            confirm_reasons=_confirm_reasons
+                                            if _confirm_reasons
+                                            else None,
+                                        )
 
                                     if dry_run:
                                         fe.rollback_session()
@@ -1281,7 +1309,13 @@ class AgentOrchestrator:
                                     and (not auto_apply or force_confirm)
                                     and not dry_run
                                 ):
-                                    conf = await confirm_cb(combined_diff)
+                                    conf = await invoke_confirm_diff_callback(
+                                        confirm_cb,
+                                        combined_diff,
+                                        confirm_reasons=_confirm_reasons
+                                        if _confirm_reasons
+                                        else None,
+                                    )
 
                                 if dry_run:
                                     logger.info(

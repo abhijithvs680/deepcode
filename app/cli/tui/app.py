@@ -18,13 +18,24 @@ from textual.widgets import Footer, Header, Input, Static, Button, RichLog
 from textual.screen import ModalScreen
 
 class ConfirmDiffScreen(ModalScreen[bool]):
-    def __init__(self, diff_text: str):
+    def __init__(
+        self,
+        diff_text: str,
+        *,
+        confirm_reasons: list[str] | None = None,
+    ):
         super().__init__()
         self.diff_text = diff_text
+        self.confirm_reasons = list(confirm_reasons or [])
 
     def compose(self) -> ComposeResult:
         with Vertical(id="diff-dialog"):
             yield Static("⚠ [bold]Proposed File Modifications[/bold]")
+            if self.confirm_reasons:
+                lines = "\n".join(f" · {escape(r)}" for r in self.confirm_reasons[:8])
+                yield Static(
+                    "[bold yellow]Confirmation required[/bold yellow]\n" + lines
+                )
             yield RichLog(id="diff-view")
             with Horizontal(id="diff-dialog-buttons"):
                 yield Button("Apply Patch (Y)", id="btn_apply", variant="success")
@@ -546,8 +557,14 @@ class DeepCodeTuiApp(App):
                 self.call_next(_push_partial)
                 last_update_t = time.perf_counter()
 
-        async def _confirm_diff_callback(combined_diff: str) -> bool:
-            return await self.push_screen_wait(ConfirmDiffScreen(diff_text=combined_diff))
+        async def _confirm_diff_callback(
+            combined_diff: str, *, confirm_reasons: list[str] | None = None
+        ) -> bool:
+            return await self.push_screen_wait(
+                ConfirmDiffScreen(
+                    diff_text=combined_diff, confirm_reasons=confirm_reasons
+                )
+            )
 
         async def _status_callback(msg: str) -> None:
             if not stream_buffer:

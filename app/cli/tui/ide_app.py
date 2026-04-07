@@ -38,6 +38,7 @@ class DeepCodeIdeApp(App):
         Binding("ctrl+b", "toggle_terminal", "Events", show=True),
         Binding("ctrl+t", "toggle_trace", "Trace", show=True),
         Binding("ctrl+i", "next_tab", "Next tab", show=True),
+        Binding("ctrl+w", "close_tab", "Close tab", show=True),
         Binding(
             "ctrl+c",
             "cancel_agent",
@@ -139,6 +140,10 @@ class DeepCodeIdeApp(App):
         self.ide_state.next_tab()
         self._refresh_all_panels()
 
+    def action_close_tab(self) -> None:
+        self.ide_state.close_active_tab()
+        self._refresh_all_panels()
+
     def _on_debounced_events(self, batch: list[dict]) -> None:
         for ev in batch:
             self.ide_state.apply_event(ev)
@@ -175,18 +180,25 @@ class DeepCodeIdeApp(App):
                             if i == self.ide_state.active_tab_index
                             else escape(t)
                         )
-                        for i, t in enumerate(self.ide_state.tabs[:6])
+                        for i, t in enumerate(self.ide_state.tabs)
                     )
                     if self.ide_state.tabs
                     else "[dim](no tabs)[/dim]"
                 )
                 tabs_w.update(
-                    f"Tabs {cur}/{nt}  [dim]Ctrl+I[/dim]  {tab_hint}"
+                    f"Tabs {cur}/{nt}  [dim]Ctrl+I[/dim] [dim]Ctrl+W[/dim] close  {tab_hint}"
                 )
                 path_w = self.query_one("#ide-editor-path", Static)
-                mode = "DIFF" if self.ide_state.diff_mode else "view"
                 af = self.ide_state.active_file or "(no file)"
-                path_w.update(f"[{mode}] {escape(af)}")
+                if self.ide_state.diff_mode and af and af != "(no file)":
+                    diff = self.ide_state.pending_diff.get(af) or ""
+                    plus, minus = self._diff_plus_minus(diff)
+                    path_w.update(
+                        f"[DIFF +{plus} -{minus}] {escape(af)}"
+                    )
+                else:
+                    mode = "view"
+                    path_w.update(f"[{mode}] {escape(af)}")
                 ed = self.query_one("#ide-editor-body", VerticalScroll)
                 ed.remove_children()
                 body = self._editor_markup()
@@ -206,6 +218,20 @@ class DeepCodeIdeApp(App):
                 pass
 
         self.call_next(_w)
+
+    @staticmethod
+    def _diff_plus_minus(diff: str) -> tuple[int, int]:
+        if not diff:
+            return 0, 0
+        adds = dels = 0
+        for line in diff.splitlines():
+            if line.startswith(("+++ ", "@@")):
+                continue
+            if line.startswith("+") and not line.startswith("+++"):
+                adds += 1
+            elif line.startswith("-") and not line.startswith("---"):
+                dels += 1
+        return adds, dels
 
     def _editor_markup(self) -> str:
         af = self.ide_state.active_file
@@ -272,11 +298,17 @@ class DeepCodeIdeApp(App):
             self.action_command_palette()
 
     def _log_terminal(self, line: str) -> None:
-        self.ide_state.log(line)
+        trimmed = self.ide_state.log(line)
 
         def _w() -> None:
             try:
-                self.query_one("#ide-terminal", RichLog).write(escape(line[:2000]))
+                term = self.query_one("#ide-terminal", RichLog)
+                if trimmed:
+                    term.clear()
+                    for ln in self.ide_state.terminal_log:
+                        term.write(escape(ln[:2000]))
+                else:
+                    term.write(escape(line[:2000]))
             except Exception:
                 pass
 
@@ -352,7 +384,7 @@ class DeepCodeIdeApp(App):
                 chatfmt.system_block(
                     "IDE: /help /metrics /trace /clear /browse /repo /run /edit /plan …\n"
                     "Ctrl+P palette  |  Ctrl+B events  |  Ctrl+T structured trace  |  "
-                    "Ctrl+I next editor tab  |  Ctrl+L clear chat"
+                    "Ctrl+I next tab  |  Ctrl+W close tab  |  Ctrl+L clear chat"
                 )
             )
             return
@@ -464,13 +496,19 @@ class DeepCodeIdeApp(App):
                 self.call_next(_push_partial)
                 last_update_t = time.perf_counter()
 
-        async def _confirm_diff_callback(combined_diff: str) -> bool:
+        async def _confirm_diff_callback(
+            combined_diff: str, *, confirm_reasons: list[str] | None = None
+        ) -> bool:
             meta = getattr(self, "ide_state", None)
             if meta and combined_diff:
                 self.ide_state.pending_diff["_session"] = combined_diff
                 self.ide_state.diff_mode = True
                 self.call_next(self._refresh_all_panels)
-            return await self.push_screen_wait(ConfirmDiffScreen(diff_text=combined_diff))
+            return await self.push_screen_wait(
+                ConfirmDiffScreen(
+                    diff_text=combined_diff, confirm_reasons=confirm_reasons
+                )
+            )
 
         async def _status_callback(msg: str) -> None:
             self._log_terminal(str(msg))
@@ -482,6 +520,10 @@ class DeepCodeIdeApp(App):
             if t == "final_answer":
                 content = str(event.get("content") or "")
                 self._final_answer_via_bus = True
+                try:
+                    self._ev_debounce.flush_now()
+                except Exception:
+                    pass
 
                 def _apply_final() -> None:
                     answer_widget.update(
@@ -499,6 +541,15 @@ class DeepCodeIdeApp(App):
 
         self._react_cancel_event = asyncio.Event()
         self._orchestrator_busy = True
+        self.ide_state.terminal_log.clear()
+
+        def _clear_term() -> None:
+            try:
+                self.query_one("#ide-terminal", RichLog).clear()
+            except Exception:
+                pass
+
+        self.call_next(_clear_term)
         try:
             self.query_one("#input", Input).disabled = True
         except Exception:
