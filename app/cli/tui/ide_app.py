@@ -349,8 +349,7 @@ class DeepCodeIdeApp(App):
                 with Vertical(id="ide-right", classes="ide-sidebar"):
                     with Vertical(id="ide-explorer-col"):
                         yield Static("Explorer", classes="ide-ribbon-label")
-                        with Container(id="ide-explorer-body"):
-                            yield VerticalScroll(id="ide-explorer-scroll")
+                        yield Container(id="ide-explorer-body")
                         yield Static("Task", classes="ide-ribbon-label")
                         yield VerticalScroll(id="ide-subgoals-scroll")
             with Vertical(id="ide-terminal-stack"):
@@ -397,6 +396,7 @@ class DeepCodeIdeApp(App):
         except Exception:
             pass
         self._shell_intro_once()
+        self._setup_explorer_workspace_tree()
         self.push_screen(IngestionLoaderScreen(self.raw_repo_input))
 
     def on_unmount(self) -> None:
@@ -427,7 +427,7 @@ class DeepCodeIdeApp(App):
             pass
 
     def _setup_explorer_workspace_tree(self) -> None:
-        """Mount a directory tree above the ranked-context panel when a repo root is known."""
+        """Idempotent: one DirectoryTree (if repo) + one context VerticalScroll — safe across reloads."""
         try:
             body = self.query_one("#ide-explorer-body", Container)
         except Exception:
