@@ -1,6 +1,6 @@
 """
-DeepCode V2 — agent IDE runtime (Textual): chat (left) | editor + terminal (center) |
-explorer + subgoals (right). Message input stays within the chat column.
+DeepCode V2 — agent IDE runtime (Textual): VS Code–style workspace — chat sidebar |
+editor (center) | explorer + subgoals (right); integrated terminal docked along the bottom.
 
 Run: deepcode ui --ide [REPO]
 """
@@ -10,13 +10,14 @@ import json
 import os
 import socket
 from pathlib import Path
+from typing import Any
 
 from rich.markup import escape
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import Footer, Header, RichLog, Static
+from textual.containers import Container, Horizontal, Vertical, VerticalScroll
+from textual.widgets import DirectoryTree, Footer, Header, RichLog, Static
 
 from app.cli.tui.widgets.ide_composer import IdeComposer
 
@@ -69,7 +70,7 @@ def _diff_covers_active_path(diff: str, active_rel: str) -> bool:
 
 
 class DeepCodeIdeApp(App):
-    """Grid-style agent IDE: same orchestrator as classic TUI, IDE-centric state + panels."""
+    """Agent IDE: editor-first workspace, docked terminal, sidebars — same orchestrator as the TUI."""
 
     TITLE = "DeepCode IDE"
     SUB_TITLE = f"{settings.LLM_PROVIDER} / {settings.LLM_MODEL}"
@@ -98,83 +99,158 @@ class DeepCodeIdeApp(App):
     ]
 
     CSS = """
-    Screen { layout: vertical; }
-    Header { background: $primary 10%; }
-    Footer { background: $panel; color: $text-muted; }
+    Screen { layout: vertical; background: #1e1e1e; }
+    Header { background: #252526; color: #cccccc; }
+    Footer { background: #252526; color: #888888; }
+    #ide-workspace {
+        height: 1fr;
+        width: 100%;
+        layout: vertical;
+        min-height: 8;
+        background: #1e1e1e;
+    }
     #ide-top {
         height: 1fr;
         layout: horizontal;
         min-height: 8;
+        background: #1e1e1e;
     }
-    #ide-chat {
-        width: 1fr;
+    .ide-sidebar {
         height: 1fr;
         layout: vertical;
-        border-right: outer $primary 25%;
+        background: #181818;
+        border: none;
+    }
+    #ide-chat {
+        width: 38;
+        min-width: 32;
+        max-width: 46;
+        padding: 0 1;
+        border-right: solid #2a2a2a;
+        background: #181818;
+        color: #bbbbbb;
+    }
+    #ide-right {
+        width: 38;
+        min-width: 30;
+        max-width: 48;
+        padding: 0 1;
+        border-left: solid #2a2a2a;
+        background: #181818;
+        color: #bbbbbb;
     }
     #ide-chat-scroll {
         height: 1fr;
         min-height: 8;
-        padding: 0 1;
+        padding: 0;
+        background: transparent;
+    }
+    #ide-chat-scroll Static.chat-line {
+        color: #aaaaaa;
     }
     #ide-center {
-        width: 2fr;
+        width: 1fr;
         height: 1fr;
+        min-width: 24;
         layout: vertical;
-        border-right: outer $primary 25%;
+        background: #1e1e1e;
+        border: none;
     }
     #ide-editor-stack {
         height: 1fr;
         min-height: 6;
         layout: vertical;
+        background: transparent;
+        border: none;
     }
     #ide-terminal-stack {
-        height: 1fr;
-        min-height: 5;
+        height: 12;
+        min-height: 6;
+        max-height: 22;
         layout: vertical;
-        border-top: outer $primary 30%;
+        border-top: solid #333333;
         padding: 0 1;
+        background: #202020;
     }
     #ide-terminal-stack.hidden {
         display: none;
         height: 0;
         min-height: 0;
+        max-height: 0;
         border: none;
-    }
-    #ide-right {
-        width: 1fr;
-        height: 1fr;
-        layout: vertical;
     }
     #ide-explorer-col {
         height: 1fr;
         min-height: 5;
         layout: vertical;
+        border: none;
+        background: transparent;
+    }
+    #ide-explorer-body {
+        height: 1fr;
+        min-height: 5;
+        layout: vertical;
+        background: transparent;
+    }
+    #ide-explorer-tree {
+        height: 2fr;
+        min-height: 8;
+        padding: 0;
+        background: transparent;
+        color: #bbbbbb;
+    }
+    #ide-explorer-tree > .tree--highlight-line {
+        background: #2a2a2a;
     }
     #ide-subgoals-scroll {
         height: 1fr;
-        min-height: 5;
-        padding: 0 1;
-        border-top: solid $primary 22%;
+        min-height: 4;
+        padding: 0;
+        background: transparent;
     }
-    .ide-panel-title {
-        background: $primary 14%;
-        text-style: bold;
-        padding: 0 1;
+    .ide-ribbon-label {
         height: 1;
+        padding: 0 1 0 1;
+        background: transparent;
+        color: #999999;
+        text-style: none;
+        border: none;
     }
-    #ide-editor-path { padding: 0 1; background: $panel; height: 1; }
-    #ide-editor-body { height: 1fr; padding: 0 1; }
+    #ide-editor-tabs {
+        height: 1;
+        padding: 0 2 0 2;
+        background: #2a2a2a;
+        color: #e6e6e6;
+        border-bottom: solid #333333;
+    }
+    #ide-editor-path {
+        padding: 0 2 0 2;
+        background: #1e1e1e;
+        height: 1;
+        color: #c0c0c0;
+        border-bottom: solid #333333;
+    }
+    #ide-editor-body {
+        height: 1fr;
+        padding: 1 2;
+        background: #1e1e1e;
+        color: #e6e6e6;
+    }
+    #ide-editor-body Static.chat-line {
+        color: #e6e6e6;
+    }
     #ide-explorer-scroll {
-        height: 2fr;
-        min-height: 5;
-        padding: 0 1;
+        height: 1fr;
+        min-height: 4;
+        padding: 0;
+        background: transparent;
     }
     Static.ide-chat-events {
         padding: 0 1 0 1;
-        margin: 0 0 0 0;
-        background: $panel 40%;
-        border-left: outer #007acc 35%;
+        margin: 0;
+        background: #252526 35%;
+        border-left: solid #007acc 55%;
+        color: #dddddd;
         height: auto;
         min-height: 1;
     }
@@ -182,47 +258,53 @@ class DeepCodeIdeApp(App):
         layout: vertical;
         height: auto;
         min-height: 3;
-        margin: 0 1 1 1;
+        margin: 0;
         padding: 0;
-        border: round #3c3c3c;
-        background: #1a1a1a;
+        border: none;
+        background: transparent;
     }
-    IdeComposer {
+    #input {
         height: 4;
         min-height: 3;
         max-height: 10;
-        border: none;
-        background: #1a1a1a;
+        background: #2a2a2a;
+        border: solid #3a3a3a;
         color: #d4d4d4;
         padding: 0 1 0 1;
     }
-    IdeComposer:focus {
-        border: none;
+    #input:focus {
+        border: solid #505050;
     }
     #ide-composer-hint {
         height: auto;
         min-height: 1;
         padding: 0 1 0 1;
-        background: #252526;
-        color: $text-muted;
-        border-top: solid #3c3c3c;
+        background: transparent;
+        color: #999999;
+        border: none;
     }
     #ide-debug-trace {
         height: 6;
         min-height: 3;
-        border-bottom: solid $primary 15%;
+        border-bottom: solid #333333;
+        background: #202020;
     }
-    #ide-shell-out { height: 1fr; min-height: 3; }
+    #ide-shell-out {
+        height: 1fr;
+        min-height: 3;
+        background: transparent;
+        padding: 0 1 0 1;
+        color: #cccccc;
+    }
     #ide-shell-prompt {
         min-height: 1;
         height: auto;
         padding: 0 1;
         margin: 0;
         background: #252526;
-        border: solid #007acc;
-        border-top: solid #007acc;
+        border: solid #3a3a3a;
+        border-top: solid #3a3a3a;
     }
-    #ide-editor-tabs { height: 1; padding: 0 1; background: $panel 80%; }
     """
 
     def __init__(
@@ -245,57 +327,51 @@ class DeepCodeIdeApp(App):
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
-        with Horizontal(id="ide-top"):
-            with Vertical(id="ide-chat"):
-                yield Static("Chat", classes="ide-panel-title")
-                yield VerticalScroll(id="ide-chat-scroll")
-                with Vertical(id="ide-composer-stack"):
-                    yield IdeComposer(
-                        "",
-                        id="input",
-                        placeholder="Add a follow-up",
-                        show_line_numbers=False,
-                        soft_wrap=True,
-                    )
-                    yield Static("", id="ide-composer-hint")
-            with Vertical(id="ide-center"):
-                with Vertical(id="ide-editor-stack"):
-                    yield Static("Editor / Diff", classes="ide-panel-title")
-                    yield Static("", id="ide-editor-tabs")
-                    yield Static("", id="ide-editor-path")
-                    yield VerticalScroll(id="ide-editor-body")
-                with Vertical(id="ide-terminal-stack"):
-                    if self._ide_debug:
-                        yield Static("Debug trace", classes="ide-panel-title")
-                        yield RichLog(
-                            id="ide-debug-trace",
-                            auto_scroll=True,
-                            wrap=True,
-                            markup=True,
+        with Vertical(id="ide-workspace"):
+            with Horizontal(id="ide-top"):
+                with Vertical(id="ide-chat", classes="ide-sidebar"):
+                    yield Static("Chat", classes="ide-ribbon-label")
+                    yield VerticalScroll(id="ide-chat-scroll")
+                    with Vertical(id="ide-composer-stack"):
+                        yield IdeComposer(
+                            "",
+                            id="input",
+                            placeholder="Message…",
+                            show_line_numbers=False,
+                            soft_wrap=True,
                         )
-                    yield Static("Terminal", classes="ide-panel-title")
+                        yield Static("", id="ide-composer-hint")
+                with Vertical(id="ide-center"):
+                    with Vertical(id="ide-editor-stack"):
+                        yield Static("", id="ide-editor-tabs")
+                        yield Static("", id="ide-editor-path")
+                        yield VerticalScroll(id="ide-editor-body")
+                with Vertical(id="ide-right", classes="ide-sidebar"):
+                    with Vertical(id="ide-explorer-col"):
+                        yield Static("Explorer", classes="ide-ribbon-label")
+                        with Container(id="ide-explorer-body"):
+                            yield VerticalScroll(id="ide-explorer-scroll")
+                        yield Static("Task", classes="ide-ribbon-label")
+                        yield VerticalScroll(id="ide-subgoals-scroll")
+            with Vertical(id="ide-terminal-stack"):
+                if self._ide_debug:
+                    yield Static("Debug", classes="ide-ribbon-label")
                     yield RichLog(
-                        id="ide-shell-out",
+                        id="ide-debug-trace",
                         auto_scroll=True,
                         wrap=True,
                         markup=True,
                     )
-                    yield ShellPromptLine(
-                        tip_fn=lambda: self._ide_shell_prompt_tip(),
-                        id="ide-shell-prompt",
-                    )
-            with Vertical(id="ide-right"):
-                with Vertical(id="ide-explorer-col"):
-                    yield Static(
-                        "Explorer — files & context",
-                        classes="ide-panel-title",
-                    )
-                    yield VerticalScroll(id="ide-explorer-scroll")
-                    yield Static(
-                        "Subgoals & current task",
-                        classes="ide-panel-title",
-                    )
-                    yield VerticalScroll(id="ide-subgoals-scroll")
+                yield RichLog(
+                    id="ide-shell-out",
+                    auto_scroll=True,
+                    wrap=True,
+                    markup=True,
+                )
+                yield ShellPromptLine(
+                    tip_fn=lambda: self._ide_shell_prompt_tip(),
+                    id="ide-shell-prompt",
+                )
         yield Footer()
 
     def on_mount(self) -> None:
@@ -311,7 +387,7 @@ class DeepCodeIdeApp(App):
         except Exception:
             pass
         try:
-            self.query_one("#ide-shell-out", RichLog).can_focus = False
+            self.query_one("#ide-shell-out", RichLog).can_focus = True
             if self._ide_debug:
                 self.query_one("#ide-debug-trace", RichLog).can_focus = False
         except Exception:
@@ -341,6 +417,7 @@ class DeepCodeIdeApp(App):
             self.sub_title = f"{settings.LLM_MODEL} | {Path(self._repo_path).name}"
         self._dispose_shell_worker()
         self._shell_intro_written = False
+        self._setup_explorer_workspace_tree()
         self._mount_chat(chatfmt.ingest_ready_banner())
         self._shell_intro_once()
         self._refresh_all_panels()
@@ -348,6 +425,51 @@ class DeepCodeIdeApp(App):
             self.query_one("#ide-shell-prompt", ShellPromptLine).refresh_tip()
         except Exception:
             pass
+
+    def _setup_explorer_workspace_tree(self) -> None:
+        """Mount a directory tree above the ranked-context panel when a repo root is known."""
+        try:
+            body = self.query_one("#ide-explorer-body", Container)
+        except Exception:
+            return
+        body.remove_children()
+        rp = (self._repo_path or "").strip()
+        if not rp:
+            body.mount(VerticalScroll(id="ide-explorer-scroll"))
+            return
+        try:
+            root = Path(rp).expanduser().resolve()
+        except OSError:
+            body.mount(VerticalScroll(id="ide-explorer-scroll"))
+            return
+        try:
+            body.mount(DirectoryTree(root, id="ide-explorer-tree"))
+        except OSError:
+            pass
+        body.mount(VerticalScroll(id="ide-explorer-scroll"))
+
+    @on(DirectoryTree.FileSelected)
+    def on_directory_tree_file_selected(self, event: DirectoryTree.FileSelected) -> None:
+        if getattr(event.control, "id", None) != "ide-explorer-tree":
+            return
+        if not self._repo_path:
+            return
+        path = event.path
+        try:
+            path = path.resolve()
+        except OSError:
+            return
+        if not path.is_file():
+            return
+        try:
+            root = Path(self._repo_path).expanduser().resolve()
+            rel = path.relative_to(root).as_posix()
+        except ValueError:
+            return
+        self._flush_ide_events()
+        self.ide_state.apply_event({"type": "agent_file_open", "path": rel})
+        self._ide_focus_editor_after_refresh = True
+        self._refresh_all_panels()
 
     @work(exclusive=True, group="shell_reset")
     async def _dispose_shell_worker(self) -> None:
@@ -474,34 +596,19 @@ class DeepCodeIdeApp(App):
                     tr.clear()
                     tr.write(self.ide_state.trace_panel_text())
                 tabs_w = self.query_one("#ide-editor-tabs", Static)
-                nt = len(self.ide_state.tabs)
-                cur = self.ide_state.active_tab_index + 1 if nt else 0
-                tab_hint = (
-                    " | ".join(
-                        (
-                            f"[bold]{escape(t)}[/bold]"
-                            if i == self.ide_state.active_tab_index
-                            else escape(t)
-                        )
-                        for i, t in enumerate(self.ide_state.tabs)
-                    )
-                    if self.ide_state.tabs
-                    else "[dim](no tabs)[/dim]"
-                )
-                tabs_w.update(
-                    f"Tabs {cur}/{nt}  [dim]Ctrl+I[/dim] [dim]Ctrl+W[/dim] close  {tab_hint}"
-                )
+                tabs_w.update(self._editor_tab_strip_markup())
                 path_w = self.query_one("#ide-editor-path", Static)
                 af = self.ide_state.active_file or "(no file)"
                 diff_raw = self._resolve_diff_raw_for_active()
-                if self.ide_state.diff_mode and diff_raw and af != "(no file)":
-                    plus, minus = self._diff_plus_minus(diff_raw)
-                    path_w.update(
-                        f"[DIFF +{plus} -{minus}] {escape(af)}"
+                path_w.update(
+                    self._editor_path_bar_markup(
+                        af,
+                        diff_mode=bool(
+                            self.ide_state.diff_mode and diff_raw and af != "(no file)"
+                        ),
+                        diff_raw=diff_raw,
                     )
-                else:
-                    mode = "view"
-                    path_w.update(f"[{mode}] {escape(af)}")
+                )
                 ed = self.query_one("#ide-editor-body", VerticalScroll)
                 ed.remove_children()
                 body = self._editor_markup()
@@ -590,11 +697,63 @@ class DeepCodeIdeApp(App):
                 dels += 1
         return adds, dels
 
+    @staticmethod
+    def _filename_from_tab_path(tab_path: str) -> str:
+        p = (tab_path or "").replace("\\", "/").strip()
+        if p == "_session":
+            return "_session"
+        return Path(p).name or p or "?"
+
+    @staticmethod
+    def _breadcrumb_markup(rel: str) -> str:
+        if not rel or rel == "(no file)":
+            return "[dim]—[/dim]"
+        r = rel.replace("\\", "/").strip()
+        if r == "_session":
+            return "[dim]_session[/dim]"
+        parts = [x for x in r.split("/") if x]
+        if not parts:
+            return escape(rel)
+        if len(parts) == 1:
+            return f"[bold]{escape(parts[0])}[/bold]"
+        head = " › ".join(escape(x) for x in parts[:-1])
+        tail = parts[-1]
+        return f"[dim]{head} ›[/dim] [bold]{escape(tail)}[/bold]"
+
+    def _editor_tab_strip_markup(self) -> str:
+        st = self.ide_state
+        tabs = st.tabs
+        hint = "  [dim]· Ctrl+I · W[/dim]"
+        if not tabs:
+            return f"[dim]—[/dim]{hint}"
+        parts: list[str] = []
+        for i, t in enumerate(tabs):
+            label = self._filename_from_tab_path(t)
+            if i == st.active_tab_index:
+                parts.append(f"[reverse bold] {escape(label)} [/reverse bold]")
+            else:
+                parts.append(f"[dim]{escape(label)}[/dim]")
+        return "  ".join(parts) + hint
+
+    def _editor_path_bar_markup(
+        self, active_display: str, *, diff_mode: bool, diff_raw: str
+    ) -> str:
+        af = active_display
+        if diff_mode and diff_raw and af not in ("(no file)", "") and af != "_session":
+            plus, minus = self._diff_plus_minus(diff_raw)
+            crumb = self._breadcrumb_markup(af)
+            return f"[yellow]DIFF[/yellow] [dim]+{plus} −{minus}[/dim]  {crumb}"
+        if not af or af == "(no file)":
+            return "[dim]—[/dim]"
+        return self._breadcrumb_markup(af)
+
     def _editor_markup(self) -> str:
         self.ide_state.ensure_active_file_fallback()
         af = self.ide_state.active_file
         if not af:
-            return "[dim]Open a file via agent read_file or explorer.[/dim]"
+            return (
+                "[dim]No file open — use Explorer (tree), agent read_file, or run a task.[/dim]"
+            )
         if self.ide_state.diff_mode:
             diff = self._resolve_diff_raw_for_active()
             if diff:
@@ -641,7 +800,49 @@ class DeepCodeIdeApp(App):
     def action_clear_chat(self) -> None:
         self._clear_chat_only()
 
+    def _is_terminal_focused(self) -> bool:
+        """True when focus is in the bottom terminal (prompt, log, or terminal stack)."""
+        try:
+            w = self.screen.focused
+            if w is None:
+                return False
+            wid = getattr(w, "id", None) or ""
+            if wid in ("ide-shell-prompt", "ide-shell-out"):
+                return True
+            node: Any = w
+            for _ in range(16):
+                pid = getattr(node, "id", None) or ""
+                if pid == "ide-terminal-stack":
+                    return True
+                node = getattr(node, "parent", None)
+                if node is None:
+                    break
+            return False
+        except Exception:
+            return False
+
+    @work(exclusive=False, group="ide_shell")
+    async def _shell_interrupt_worker(self) -> None:
+        sh = getattr(self, "_ide_shell", None)
+        if sh is None:
+            return
+        await sh.start()
+        await sh.send_interrupt()
+
+        def _log() -> None:
+            try:
+                self.query_one("#ide-shell-out", RichLog).write(
+                    "[dim]^C  [interrupt sent to shell][/dim]"
+                )
+            except Exception:
+                pass
+
+        self.call_next(_log)
+
     def action_cancel_agent(self) -> None:
+        if self._is_terminal_focused():
+            self._shell_interrupt_worker()
+            return
         if getattr(self, "_orchestrator_busy", False):
             ev = getattr(self, "_react_cancel_event", None)
             if ev is not None and hasattr(ev, "set"):

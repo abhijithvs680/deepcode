@@ -76,9 +76,26 @@ class IDEState:
     pending_shell_proposal: dict[str, Any] | None = None
 
     def ensure_active_file_fallback(self) -> None:
-        """If nothing is focused but we have open tabs, show the most recent tab."""
-        if (not (self.active_file or "").strip()) and self.open_files:
-            self.active_file = str(self.open_files[-1]).replace("\\", "/")
+        """If no active file is set, use MRU open tab or highest-ranked file (keeps editor alive)."""
+        if (self.active_file or "").strip():
+            return
+        if self.open_files:
+            # Newest paths are inserted at the front of open_files.
+            self.active_file = str(self.open_files[0]).replace("\\", "/")
+            return
+        if self.file_scores:
+            ranked = [
+                p
+                for p in self.file_scores
+                if self._norm_path(str(p)) not in self.closed_paths
+            ]
+            if not ranked:
+                return
+            best = max(ranked, key=lambda p: self.file_scores.get(p, 0.0))
+            self.active_file = str(best).replace("\\", "/")
+            if self.active_file not in self.open_files:
+                self.open_files.insert(0, self.active_file)
+            self._normalize_all_paths()
 
     def log(self, line: str) -> bool:
         """Append a terminal line; returns True if oldest lines were dropped."""
@@ -360,17 +377,17 @@ class IDEState:
         cf = m.get("conflicts") or []
         gp = m.get("gaps") or []
         if ag:
-            lines.append("[bold]Agreements[/bold]")
+            lines.append("[dim]Agree[/dim]")
             for x in ag[:4]:
                 lines.append(f" · {str(x)[:100]}")
             lines.append("")
         if cf:
-            lines.append("[bold]Conflicts[/bold]")
+            lines.append("[dim]Conflict[/dim]")
             for x in cf[:5]:
                 lines.append(f" ⚠ {str(x)[:100]}")
             lines.append("")
         if gp:
-            lines.append("[bold]Gaps[/bold]")
+            lines.append("[dim]Gaps[/dim]")
             for x in gp[:5]:
                 lines.append(f" · {str(x)[:100]}")
         return "\n".join(lines).strip() or "[dim](no synthesis meta)[/dim]"
@@ -378,7 +395,7 @@ class IDEState:
     def prior_findings_text(self) -> str:
         if not self.global_insights:
             return ""
-        lines = ["[bold]Previous findings[/bold]"]
+        lines = ["[dim]Findings[/dim]"]
         for x in self.global_insights[-6:]:
             lines.append(f" · {str(x)[:120]}")
         return "\n".join(lines)
@@ -386,23 +403,22 @@ class IDEState:
     def current_task_panel_text(self) -> str:
         """Macro / long-run task line for the tasks column."""
         ct = self.current_task
-        lines: list[str] = ["[bold]> Current task[/bold]"]
+        lines: list[str] = ["[dim]Now[/dim]"]
         if ct.get("description"):
             tid = ct.get("task_id") or "?"
             lines.append(
-                f" · [{rich_escape(str(tid))}] "
+                f"[{rich_escape(str(tid))}] "
                 f"{rich_escape(str(ct.get('description', ''))[:220])}"
             )
         else:
-            lines.append(" [dim](none)[/dim]")
+            lines.append("[dim]—[/dim]")
         return "\n".join(lines)
 
     def explorer_panel_text(self) -> str:
         """
-        Rankings, working set, cross-subgoal — upper part of the right column
-        (subgoals + current task sit below this in the IDE layout).
+        AI / ranking context below the filesystem tree (dense labels).
         """
-        lines: list[str] = []
+        lines: list[str] = ["[dim]── AI context ──[/dim]", ""]
         ws_set = set(self.working_set)
         ranked = sorted(
             (
@@ -421,37 +437,37 @@ class IDEState:
 
         cs = self.cross_subgoal_panel()
         if cs and cs != "[dim](no synthesis meta)[/dim]":
-            lines.append("[bold]Cross-subgoal[/bold]")
+            lines.append("[dim]Synthesis[/dim]")
             lines.append(cs)
             lines.append("")
 
-        lines.append("[bold]> Active files (working set)[/bold]")
+        lines.append("[dim]Active[/dim]")
         if self.working_set:
             for p in self.working_set[:MAX_WORKING_SET]:
                 sc = float(self.file_scores.get(p, 0.0))
                 lines.append(
-                    f" [green]▸[/green] {p}  [dim]score {sc:.2f}[/dim]  {_stars(min(4.0, sc))}"
+                    f" [green]▸[/green] {p}  [dim]{sc:.2f}[/dim]  {_stars(min(4.0, sc))}"
                 )
         else:
-            lines.append(" [dim](empty — run exploration)[/dim]")
+            lines.append(" [dim]—[/dim]")
 
         lines.append("")
-        lines.append("[bold]> Other ranked files[/bold]")
+        lines.append("[dim]Ranked[/dim]")
         shown = 0
         for p in ranked:
             if p in ws_set:
                 continue
             sc = float(self.file_scores.get(p, 0))
-            lines.append(f" · {p}  [dim]score {sc:.2f}[/dim]  {_stars(min(4.0, sc))}")
+            lines.append(f" · {p}  [dim]{sc:.2f}[/dim]  {_stars(min(4.0, sc))}")
             shown += 1
             if shown >= 14:
                 break
         if shown == 0:
-            lines.append(" [dim](none yet)[/dim]")
+            lines.append(" [dim]—[/dim]")
 
         if self.touched_files:
             lines.append("")
-            lines.append("[bold]Previously touched[/bold]")
+            lines.append("[dim]Touched[/dim]")
             for p in self.touched_files[-10:]:
                 lines.append(f" · {p}")
         return "\n".join(lines)
@@ -466,7 +482,12 @@ class IDEState:
 
     def subgoals_tasks_panel_text(self) -> str:
         """ReAct subgoal timeline + macro current task (panel below explorer)."""
-        return self.timeline_text() + "\n\n" + self.current_task_panel_text()
+        return (
+            "[dim]── Plan ──[/dim]\n"
+            + self.timeline_text()
+            + "\n\n"
+            + self.current_task_panel_text()
+        )
 
     def run_events_panel_text(self) -> str:
         """Status + compact tool trace for inline chat (below assistant message)."""
@@ -580,7 +601,7 @@ class IDEState:
 
     def timeline_text(self) -> str:
         if not self.subgoal_timeline:
-            return "[dim](no subgoals yet)[/dim]"
+            return "[dim]—[/dim]"
         lines = []
         for i, row in enumerate(self.subgoal_timeline[-14:], 1):
             st = row.get("status") or "?"

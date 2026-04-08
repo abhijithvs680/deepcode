@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import signal
+import subprocess
 import sys
 from collections.abc import Callable
 from typing import Any
@@ -44,6 +46,8 @@ class IdeSubprocessShell:
                 return
             try:
                 if sys.platform == "win32":
+                    # Required so CTRL_C_EVENT can target this child without killing the IDE.
+                    creation = subprocess.CREATE_NEW_PROCESS_GROUP
                     self._proc = await asyncio.create_subprocess_exec(
                         "cmd.exe",
                         stdin=asyncio.subprocess.PIPE,
@@ -51,6 +55,7 @@ class IdeSubprocessShell:
                         stderr=asyncio.subprocess.STDOUT,
                         cwd=self._cwd,
                         env=os.environ.copy(),
+                        creationflags=creation,
                     )
                 else:
                     self._proc = await asyncio.create_subprocess_exec(
@@ -99,6 +104,30 @@ class IdeSubprocessShell:
         data = (line.rstrip("\r\n") + os.linesep).encode("utf-8", errors="replace")
         proc.stdin.write(data)
         await proc.stdin.drain()
+
+    async def send_interrupt(self) -> None:
+        """Send SIGINT / CTRL+C to the shell child (focus-aware IDE routing)."""
+        async with self._lock:
+            proc = self._proc
+            if proc is None or proc.returncode is not None:
+                return
+            try:
+                if sys.platform == "win32":
+                    proc.send_signal(signal.CTRL_C_EVENT)
+                else:
+                    proc.send_signal(signal.SIGINT)
+            except ProcessLookupError:
+                return
+            except Exception:
+                pass
+            if sys.platform != "win32":
+                try:
+                    stdin = proc.stdin
+                    if stdin is not None and not stdin.is_closing():
+                        stdin.write(b"\x03")
+                        await stdin.drain()
+                except Exception:
+                    pass
 
     async def stop(self) -> None:
         async with self._lock:
