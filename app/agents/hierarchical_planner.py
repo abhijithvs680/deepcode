@@ -214,6 +214,9 @@ def create_substate(parent_state: dict[str, Any], subgoal: Subgoal) -> dict[str,
     )
     s["carryover_symbols"] = select_carryover_symbols(parent_state, k=10)
     s["carryover_insights"] = select_carryover_insights(parent_state, k=4)
+    s["last_shell_commands"] = list(parent_state.get("last_shell_commands") or [])[
+        -12:
+    ]
     cap_aws = int(getattr(get_settings(), "ACTIVE_WORKING_SET_MAX", 8) or 8)
     cap_aws = max(4, min(cap_aws, 16))
     s["active_working_set"] = list(parent_state.get("active_working_set") or [])[
@@ -436,6 +439,7 @@ def merge_react_subgoal_results(
     total_failed = 0
     flat_steps: list[dict[str, Any]] = []
     flat_obs: list[str] = []
+    acc_shell: list[dict[str, Any]] = []
 
     for sg, sub in subgoal_runs:
         if bool(sub.get("react_force_rag")):
@@ -449,6 +453,11 @@ def merge_react_subgoal_results(
                 t2 = dict(tr)
                 t2["_subgoal_id"] = sg.id
                 acc_tool.append(t2)
+        for row in sub.get("last_shell_commands") or []:
+            if isinstance(row, dict):
+                r2 = dict(row)
+                r2["_subgoal_id"] = sg.id
+                acc_shell.append(r2)
         for k, v in (sub.get("file_scores") or {}).items():
             try:
                 kn = str(k).replace("\\", "/")
@@ -531,6 +540,7 @@ def merge_react_subgoal_results(
             if kn:
                 prior_union.add(kn)
     parent_state["prior_react_signal_paths"] = list(prior_union)[:120]
+    parent_state["last_shell_commands"] = acc_shell[-16:]
     if subgoal_runs:
         _last_sub = subgoal_runs[-1][1]
         r = str(_last_sub.get("react_early_stop_reason") or "").strip()

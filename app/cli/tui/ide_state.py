@@ -477,9 +477,14 @@ class IDEState:
             ph = str(
                 (self.agent_status or {}).get("agent_execution_phase") or "explore"
             ).lower()
-            if ph == "execute":
-                return "Execute"
-            return "Explore"
+            base = "Execute" if ph == "execute" else "Explore"
+            a = self.agent_status or {}
+            c = float(a.get("confidence") or self.confidence or 0)
+            if a.get("weak_grounding") or c < 0.45:
+                return f"{base} (low confidence)"
+            if c < 0.62:
+                return f"{base} (medium confidence)"
+            return base
         return "Ready"
 
     def composer_chrome_hint(self) -> str:

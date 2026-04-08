@@ -19,8 +19,8 @@ from app.agents.react_grounding import (
     compute_answer_confidence,
     extract_goal,
     goal_progress_delta,
+    infer_scaffold_shell_command,
     keyword_relevance,
-    looks_like_explicit_task_command,
     looks_like_task_execution_query,
     scaffold_shell_hint,
 )
@@ -160,7 +160,10 @@ def _norm_rel_path(p: str) -> str:
 
 
 def _react_evidence_unlocks_execution(state: dict[str, Any], settings: Any) -> bool:
-    """Require grounding evidence before shell / mutating edits when exploration-first is on."""
+    """
+    Hybrid gating: confidence or goal_progress alone cannot unlock — require at least
+    one file read with those signals, or strong file/symbol counts.
+    """
     thr_f = int(getattr(settings, "REACT_EXEC_UNLOCK_MIN_FILES_READ", 2) or 2)
     thr_s = int(getattr(settings, "REACT_EXEC_UNLOCK_MIN_SYMBOLS", 2) or 2)
     conf_thr = float(
@@ -178,9 +181,63 @@ def _react_evidence_unlocks_execution(state: dict[str, Any], settings: Any) -> b
     return (
         nfr >= thr_f
         or nsy >= thr_s
-        or ac >= conf_thr
-        or gp >= gp_thr
+        or (ac >= conf_thr and nfr >= 1)
+        or (gp >= gp_thr and nfr >= 1)
     )
+
+
+def _rank_probe_search_paths(paths: list[str], query: str) -> list[str]:
+    """Order search hits by relevance to the user task (path + filename vs query)."""
+    q = (query or "").strip()
+    uniq: list[str] = []
+    seen: set[str] = set()
+    for p in paths:
+        n = _norm_rel_path(p).strip()
+        if n and n not in seen:
+            seen.add(n)
+            uniq.append(n)
+    if not q:
+        return uniq
+    scored: list[tuple[float, int, str]] = []
+    for idx, p in enumerate(uniq):
+        base = p.split("/")[-1] if p else ""
+        rel = keyword_relevance(q, p, base.replace("_", " "))
+        scored.append((rel, idx, p))
+    scored.sort(key=lambda t: (-t[0], t[1]))
+    return [t[2] for t in scored]
+
+
+def _shell_retry_pointless(res: ToolResult) -> bool:
+    """True when stderr/stdout indicates a bad command — repeating it will not help."""
+    parts: list[str] = [str(res.error or "")]
+    d = res.data if isinstance(res.data, dict) else {}
+    parts.append(str(d.get("stderr") or ""))
+    parts.append(str(d.get("stdout") or ""))
+    blob = "\n".join(parts).lower()
+    needles = (
+        "not found",
+        "not recognized",
+        "is not recognized",
+        "unknown option",
+        "unknown command",
+        "enoent",
+        "no such file",
+        "cannot find",
+        "is not available",
+        "bad interpreter",
+        "syntax error",
+        "unexpected token",
+    )
+    return any(n in blob for n in needles)
+
+
+def _files_read_key_set(state: dict[str, Any]) -> set[str]:
+    out: set[str] = set()
+    for x in state.get("files_read") or []:
+        n = _norm_rel_path(str(x)).strip().lstrip("./")
+        if n:
+            out.add(n)
+    return out
 
 
 _REL_OK = 0.22
@@ -681,14 +738,6 @@ async def run_reasoning_loop(
     q = state.get("current_step") or state.get("query") or ""
 
     task_like_shell = looks_like_task_execution_query(str(q))
-    ask_shell_thr = float(
-        getattr(settings, "REACT_ASK_MODE_SHELL_MIN_CONFIDENCE_DEFAULT", 0.6) or 0.6
-    )
-    if task_like_shell and looks_like_explicit_task_command(str(q)):
-        ask_shell_thr = float(
-            getattr(settings, "REACT_ASK_MODE_SHELL_MIN_CONFIDENCE_EXPLICIT", 0.4)
-            or 0.4
-        )
 
     explore_first = bool(getattr(settings, "REACT_EXPLORATION_FIRST", True))
     mode_ask = str(state.get("mode") or "").lower() == "ask"
@@ -704,13 +753,9 @@ async def run_reasoning_loop(
     )
 
     shell_ok = intent_s == "structured"
-    if (
-        not shell_ok
-        and mode_ask
-        and intent_s != "broad"
-        and cls_loop >= ask_shell_thr
-        and task_like_shell
-    ):
+    if not shell_ok and mode_ask and intent_s != "broad" and task_like_shell:
+        # `looks_like_task_execution_query` is needle-gated; allow shell even when
+        # classifier confidence is low so installs/scaffolds are not prose-only.
         shell_ok = True
     if bool(state.get("long_run_mode")):
         shell_ok = shell_ok and bool(
@@ -765,6 +810,7 @@ async def run_reasoning_loop(
     state["react_edit_line_estimate"] = 0
     state["react_force_rag"] = intent_s == "broad"
     state["_probe_search_paths"] = []
+    state.setdefault("last_shell_commands", [])
     state["file_scores"] = dict(state.get("file_scores") or {})
     file_scores: dict[str, float] = defaultdict(float)
     last_touch_step: dict[str, int] = {}
@@ -907,11 +953,20 @@ async def run_reasoning_loop(
                 f"{json.dumps([str(x)[:200] for x in synh[:8]])}\n"
             )
 
+        shell_mem = ""
+        lsc = state.get("last_shell_commands") or []
+        if lsc:
+            shell_mem = (
+                "Recent shell (this subgoal):\n"
+                f"{json.dumps(lsc[-4:], default=str)[:1100]}\n"
+            )
+
         user_block = (
             f"User task: {q}\n"
             f"{scaffold_shell_hint(q)}"
             f"{edit_extra}"
             f"{hint_extra}"
+            f"{shell_mem}"
             f"{_exploration_hint(i, max_steps, intent)}\n"
             f"{summary_note}"
             f"Router hint: tool={router!r} confidence={rconf:.2f}\n"
@@ -944,6 +999,8 @@ async def run_reasoning_loop(
         step.setdefault("done", False)
 
         if bool(state.get("react_low_signal_repo_probe")):
+            ranked = list(state.get("_probe_search_paths") or [])
+            fr = _files_read_key_set(state)
             if i == 0:
                 step["tool"] = "file"
                 step["action"] = "search"
@@ -951,16 +1008,72 @@ async def run_reasoning_loop(
                     "query": (str(q or "").strip()[:120] or "main entry")
                 }
                 step["done"] = False
-            elif i == 1:
-                candidates = list(state.get("_probe_search_paths") or [])
-                step["tool"] = "file"
-                step["done"] = False
-                if candidates:
+            elif i in (1, 2):
+                pick = None
+                for p in ranked:
+                    pn = _norm_rel_path(p).strip().lstrip("./")
+                    if pn and pn not in fr:
+                        pick = p
+                        break
+                if pick:
+                    step["tool"] = "file"
                     step["action"] = "read_file"
-                    step["args"] = {"path": candidates[0]}
-                else:
+                    step["args"] = {"path": pick}
+                    step["done"] = False
+                elif i == 1 and not ranked:
+                    step["tool"] = "file"
                     step["action"] = "list_dir"
                     step["args"] = {"path": ".", "depth": 2}
+                    step["done"] = False
+
+        _scaf = scaffold_shell_hint(str(q)).strip()
+        if (
+            _scaf
+            and max_steps >= 2
+            and not bool(state.get("react_low_signal_repo_probe"))
+        ):
+            premature = (
+                not step.get("tool")
+                or step.get("done")
+                or str(step.get("action") or "").strip().lower() == "done"
+            )
+            if premature:
+                if i == 0:
+                    state["react_observations"].append(
+                        "Scaffold request: model tried to finish without tools — "
+                        "listing workspace first."
+                    )
+                    step = {
+                        "thought": "Scaffold request — inspect workspace before CLI.",
+                        "tool": "file",
+                        "action": "list_dir",
+                        "args": {"path": ".", "depth": 2},
+                        "done": False,
+                    }
+                elif i == 1:
+                    cmd = infer_scaffold_shell_command(str(q))
+                    if shell_ok and cmd:
+                        state["react_observations"].append(
+                            "Scaffold request: running scaffold CLI (confirm in UI if prompted)."
+                        )
+                        step = {
+                            "thought": "Run the scaffold command the user asked for.",
+                            "tool": "shell",
+                            "action": "run_command",
+                            "args": {
+                                "command": cmd,
+                                "title": "Scaffold project",
+                            },
+                            "done": False,
+                        }
+                    else:
+                        step = {
+                            "thought": "Search workspace for relevant files.",
+                            "tool": "file",
+                            "action": "search",
+                            "args": {"query": str(q)[:100]},
+                            "done": False,
+                        }
 
         state["react_steps"].append(
             {
@@ -1231,7 +1344,12 @@ async def run_reasoning_loop(
                 or "no confirm_shell_callback" in err_s
             )
             timed = "timed out" in err_s or "timeout" in err_s
-            if not skip_like and not no_cb and not timed:
+            futile = _shell_retry_pointless(res)
+            if futile:
+                state["react_observations"].append(
+                    f"Step {i}: shell failed (no retry — error looks non-transient)"
+                )
+            if not skip_like and not no_cb and not timed and not futile:
                 state["react_observations"].append(
                     f"Step {i}: shell failed — retrying once ({(res.error or '')[:80]})"
                 )
@@ -1243,6 +1361,24 @@ async def run_reasoning_loop(
                     state["react_observations"].append(
                         f"Step {i}: shell retry error {exc}"
                     )
+
+        if tool_name == "shell" and res is not None:
+            dsh = res.data if isinstance(res.data, dict) else {}
+            cmd_s = str(args.get("command") or dsh.get("command") or "").strip()
+            out_tail = str(dsh.get("stdout") or "")[-600:]
+            err_tail = str(dsh.get("stderr") or "")[-600:]
+            lst = state.setdefault("last_shell_commands", [])
+            lst.append(
+                {
+                    "command": cmd_s[:500],
+                    "success": bool(res.success),
+                    "exit_code": dsh.get("exit_code"),
+                    "error": (res.error or "")[:300] if not res.success else None,
+                    "stdout_tail": out_tail,
+                    "stderr_tail": err_tail,
+                }
+            )
+            state["last_shell_commands"] = lst[-12:]
 
         useful = _tool_step_useful(res, q)
         if res and res.success and tool_name == "file_edit":
@@ -1273,7 +1409,10 @@ async def run_reasoning_loop(
                     if isinstance(fp, str) and fp.strip():
                         probe_paths.append(fp.replace("\\", "/"))
             if probe_paths:
-                state["_probe_search_paths"] = probe_paths[:16]
+                ranked_paths = _rank_probe_search_paths(
+                    probe_paths, str(q or "")
+                )
+                state["_probe_search_paths"] = ranked_paths[:16]
 
         dumped = res.model_dump() if res is not None else {}
         state["tool_results"].append(dumped)

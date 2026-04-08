@@ -223,6 +223,9 @@ class AnswerAgent(BaseAgent):
                 react_payload["earlier_summary"] = rs[:800]
             if priority_files:
                 react_payload["priority_files"] = priority_files[:2]
+            lsc = state.get("last_shell_commands") or []
+            if lsc:
+                react_payload["recent_shell"] = lsc[-8:]
             react_text = truncate_to_token_budget(
                 json.dumps(react_payload, indent=2, default=str),
                 max_tokens=min(2048, self.settings.CONTEXT_BUDGET_TOOL + 512),

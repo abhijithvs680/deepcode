@@ -200,6 +200,36 @@ def scaffold_shell_hint(query: str) -> str:
     )
 
 
+def infer_scaffold_shell_command(query: str) -> str | None:
+    """
+    Single-line scaffold CLI when the user asked for a new frontend project.
+    Only used when scaffold_shell_hint would apply — not for arbitrary task-like queries.
+    """
+    if not scaffold_shell_hint(query).strip():
+        return None
+    ql = (query or "").lower()
+    name = "my-react-app"
+    for token in (
+        "chatbot",
+        "dashboard",
+        "portal",
+        "client",
+        "frontend",
+        "admin",
+        "widget",
+    ):
+        if token in ql:
+            name = f"{token}-app" if token != "client" else "client-app"
+            break
+    if "next" in ql or "nextjs" in ql or "next.js" in ql:
+        return f"npx create-next-app@latest {name} --yes"
+    if "vite" in ql:
+        return (
+            f"npm create vite@latest {name} -- --template react"
+        )
+    return f"npx create-react-app {name}"
+
+
 def looks_like_task_execution_query(query: str) -> bool:
     """User wants to run tests, installs, scaffolds, or checks — shell tool may apply (ask mode)."""
     q = (query or "").lower()

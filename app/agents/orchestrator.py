@@ -491,6 +491,7 @@ class AgentOrchestrator:
             "rag_reason": "",
             "react_steps": [],
             "react_observations": [],
+            "last_shell_commands": [],
             "files_read": [],
             "symbols_found": [],
             "react_force_rag": False,
@@ -521,7 +522,9 @@ class AgentOrchestrator:
                 compute_answer_confidence,
                 is_trivial_query,
                 looks_like_repo_exploration_query,
+                looks_like_task_execution_query,
                 low_signal_probe_max_steps,
+                scaffold_shell_hint,
             )
             from app.core.event_bus import EventBus
 
@@ -560,6 +563,12 @@ class AgentOrchestrator:
                         self.settings,
                         state.get("workspace_root"),
                     )
+                elif looks_like_task_execution_query(
+                    question
+                ) or scaffold_shell_hint(question).strip():
+                    # Needs tools / shell (install, scaffold, tests) — never substitute a
+                    # prose-only “how to” answer for the full ReAct pipeline.
+                    pass
                 else:
                     prompt_ls = (
                         "You are a helpful coding assistant. The query had a weak automatic "
