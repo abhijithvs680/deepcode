@@ -274,6 +274,21 @@ def looks_like_task_execution_query(query: str) -> bool:
     return any(n in q for n in needles)
 
 
+def derive_agent_mode(question: str) -> str:
+    """
+    Control-plane mode: chat vs exploration vs execution-heavy asks.
+    Order: scaffold → task-like CLI → repo navigation → default chat.
+    """
+    q = (question or "").strip()
+    if scaffold_shell_hint(q).strip():
+        return "execute"
+    if looks_like_task_execution_query(q):
+        return "execute"
+    if looks_like_repo_exploration_query(q):
+        return "explore"
+    return "chat"
+
+
 def looks_like_explicit_task_command(query: str) -> bool:
     """
     Obvious one-shot dev commands (pytest, pip install, …) — allow looser classifier confidence.

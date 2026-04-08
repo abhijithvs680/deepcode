@@ -174,6 +174,7 @@ _SUBSTATE_KEYS = frozenset(
         "latency_ms",
         "learned_file_bias",
         "prior_react_signal_paths",
+        "agent_mode",
     }
 )
 

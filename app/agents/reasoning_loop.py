@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 from collections import defaultdict
@@ -163,6 +164,7 @@ def _react_evidence_unlocks_execution(state: dict[str, Any], settings: Any) -> b
     """
     Hybrid gating: confidence or goal_progress alone cannot unlock — require at least
     one file read with those signals, or strong file/symbol counts.
+    Negative gate: very weak grounding cannot unlock until enough distinct reads.
     """
     thr_f = int(getattr(settings, "REACT_EXEC_UNLOCK_MIN_FILES_READ", 2) or 2)
     thr_s = int(getattr(settings, "REACT_EXEC_UNLOCK_MIN_SYMBOLS", 2) or 2)
@@ -172,18 +174,73 @@ def _react_evidence_unlocks_execution(state: dict[str, Any], settings: Any) -> b
     gp_thr = float(
         getattr(settings, "REACT_EXEC_UNLOCK_MIN_GOAL_PROGRESS", 0.35) or 0.35
     )
+    weak_min = int(
+        getattr(settings, "REACT_EXEC_WEAK_GROUNDING_MIN_FILES", 3) or 3
+    )
+    weak_min = max(2, weak_min)
     thr_f = max(1, thr_f)
     thr_s = max(1, thr_s)
     nfr = len(state.get("files_read") or [])
     nsy = len(state.get("symbols_found") or [])
     ac = compute_answer_confidence(state)
     gp = float(state.get("goal_progress") or 0)
+    weak_grounding = nfr < 2 and nsy == 0 and ac < 0.5
+    if weak_grounding and nfr < weak_min:
+        return False
     return (
         nfr >= thr_f
         or nsy >= thr_s
         or (ac >= conf_thr and nfr >= 1)
         or (gp >= gp_thr and nfr >= 1)
     )
+
+
+_PROBE_ENTRY_BASENAMES: frozenset[str] = frozenset(
+    {
+        "main.py",
+        "app.py",
+        "manage.py",
+        "index.js",
+        "index.ts",
+        "index.tsx",
+        "index.jsx",
+        "server.js",
+        "server.ts",
+        "app.tsx",
+        "app.jsx",
+        "main.ts",
+        "main.tsx",
+        "package.json",
+        "pyproject.toml",
+        "requirements.txt",
+        "cargo.toml",
+        "go.mod",
+    }
+)
+
+
+def _probe_path_structure_boost(path: str) -> float:
+    """Cheap structural prior on top of lexical relevance."""
+    pl = _norm_rel_path(path).lower()
+    base = pl.rsplit("/", 1)[-1] if pl else ""
+    boost = 0.0
+    if base in _PROBE_ENTRY_BASENAMES:
+        boost += 3.0
+    for frag, w in (
+        ("/config", 2.0),
+        ("config/", 2.0),
+        ("settings", 1.5),
+        ("/auth", 2.0),
+        ("auth/", 2.0),
+        ("middleware", 1.2),
+        ("routes/", 1.5),
+        ("router", 1.2),
+        ("api/", 1.5),
+        ("src/", 0.8),
+    ):
+        if frag in pl:
+            boost += w
+    return boost
 
 
 def _rank_probe_search_paths(paths: list[str], query: str) -> list[str]:
@@ -196,15 +253,116 @@ def _rank_probe_search_paths(paths: list[str], query: str) -> list[str]:
         if n and n not in seen:
             seen.add(n)
             uniq.append(n)
-    if not q:
-        return uniq
     scored: list[tuple[float, int, str]] = []
     for idx, p in enumerate(uniq):
         base = p.split("/")[-1] if p else ""
-        rel = keyword_relevance(q, p, base.replace("_", " "))
+        rel = keyword_relevance(q, p, base.replace("_", " ")) if q else 0.0
+        rel += _probe_path_structure_boost(p)
         scored.append((rel, idx, p))
     scored.sort(key=lambda t: (-t[0], t[1]))
     return [t[2] for t in scored]
+
+
+def _workspace_sparse_for_scaffold(workspace_root: str, settings: Any) -> bool:
+    """True when the repo root looks empty enough to scaffold without list_dir first."""
+    if not workspace_root or not os.path.isdir(workspace_root):
+        return False
+    cap = int(
+        getattr(settings, "REACT_SCAFFOLD_SPARSE_DIR_MAX_ENTRIES", 4) or 4
+    )
+    cap = max(0, min(cap, 32))
+    skip = frozenset(
+        {
+            ".git",
+            ".deepcode",
+            ".cursor",
+            "__pycache__",
+            ".venv",
+            "venv",
+            "node_modules",
+            ".idea",
+            ".vscode",
+        }
+    )
+    try:
+        names = os.listdir(workspace_root)
+    except OSError:
+        return False
+    n = 0
+    for name in names:
+        if name.startswith("."):
+            continue
+        if name in skip:
+            continue
+        n += 1
+        if n > cap:
+            return False
+    return n <= cap
+
+
+def _shell_failure_recovery_hints(entry: dict[str, Any]) -> str:
+    """Actionable next steps from the last shell failure (planner + observations)."""
+    blob = " ".join(
+        [
+            str(entry.get("error") or ""),
+            str(entry.get("stderr_tail") or ""),
+            str(entry.get("stdout_tail") or ""),
+            str(entry.get("command") or ""),
+        ]
+    ).lower()
+    hints: list[str] = []
+    if any(
+        x in blob
+        for x in (
+            "not recognized",
+            "not found",
+            "is not recognized",
+            "'npx'",
+            "`npx`",
+            "enoent",
+        )
+    ):
+        if "npx" in blob or "npm" in blob or "node" in blob:
+            hints.append(
+                "Ensure Node.js is installed and on PATH (try `node -v` / `where npx`)."
+            )
+    if "python" in blob and (
+        "not found" in blob or "not recognized" in blob or "bad interpreter" in blob
+    ):
+        hints.append(
+            "Python not on PATH — activate a venv or use the full path to python."
+        )
+    if "eacces" in blob or "permission denied" in blob:
+        hints.append(
+            "Permission error — use a subfolder in the workspace, not system directories."
+        )
+    if "already exists" in blob or "eexist" in blob or "file exists" in blob:
+        hints.append(
+            "Target folder exists — pick a new project name or remove/rename the directory."
+        )
+    if "npm err" in blob or ("enoent" in blob and "package.json" in blob):
+        hints.append(
+            "npm could not read package.json — check cwd or run from the app root."
+        )
+    if "create-react-app" in blob and (
+        "deprecated" in blob or "unsupported" in blob or "error" in blob
+    ):
+        hints.append(
+            "CRA issues: consider `npm create vite@latest <name> -- --template react`."
+        )
+    if not hints:
+        hints.append("Read stderr; fix the command, cwd, or environment, then retry.")
+    return " ".join(hints)
+
+
+def _shell_recovery_prompt_block(state: dict[str, Any]) -> str:
+    lsc = state.get("last_shell_commands") or []
+    if not lsc or lsc[-1].get("success"):
+        return ""
+    hint = _shell_failure_recovery_hints(lsc[-1])
+    if not hint:
+        return ""
+    return f"Last shell failed — recovery guidance:\n{hint}\n"
 
 
 def _shell_retry_pointless(res: ToolResult) -> bool:
@@ -727,6 +885,10 @@ async def run_reasoning_loop(
         state["react_force_rag"] = True
         max_steps = min(max_steps, 1)
 
+    amode = str(state.get("agent_mode") or "chat").lower()
+    if amode == "execute":
+        state.pop("react_low_signal_repo_probe", None)
+
     if bool(state.get("react_low_signal_repo_probe")):
         pm = int(
             state.get("react_probe_max_steps")
@@ -734,6 +896,13 @@ async def run_reasoning_loop(
             or 2
         )
         max_steps = max(1, min(pm, hard_cap))
+
+    if amode == "execute":
+        cap_ex = int(getattr(settings, "REACT_MAX_STEPS_EXECUTE_MODE", 3) or 3)
+        max_steps = max(1, min(max_steps, cap_ex))
+    elif amode == "chat":
+        cap_ch = int(getattr(settings, "REACT_MAX_STEPS_CHAT_MODE", 2) or 2)
+        max_steps = max(1, min(max_steps, cap_ch))
 
     q = state.get("current_step") or state.get("query") or ""
 
@@ -750,6 +919,7 @@ async def run_reasoning_loop(
         or task_like_shell
         or intent_s == "structured"
         or bool(state.get("long_run_mode"))
+        or amode == "execute"
     )
 
     shell_ok = intent_s == "structured"
@@ -811,6 +981,7 @@ async def run_reasoning_loop(
     state["react_force_rag"] = intent_s == "broad"
     state["_probe_search_paths"] = []
     state.setdefault("last_shell_commands", [])
+    state.pop("_scaffold_opened_shell_early", None)
     state["file_scores"] = dict(state.get("file_scores") or {})
     file_scores: dict[str, float] = defaultdict(float)
     last_touch_step: dict[str, int] = {}
@@ -878,6 +1049,7 @@ async def run_reasoning_loop(
     state["react_early_stop_reason"] = ""
     last_loop_i = -1
     for i in range(max_steps):
+        am = str(state.get("agent_mode") or "chat").lower()
         last_loop_i = i
         cancel_ev = state.get("react_cancel_event")
         if cancel_ev is not None and getattr(cancel_ev, "is_set", lambda: False)():
@@ -960,13 +1132,34 @@ async def run_reasoning_loop(
                 "Recent shell (this subgoal):\n"
                 f"{json.dumps(lsc[-4:], default=str)[:1100]}\n"
             )
+        shell_rec = _shell_recovery_prompt_block(state)
+
+        mode_ctrl = ""
+        if am == "execute":
+            mode_ctrl = (
+                "Control plane: agent_mode=execute — prioritize shell.run_command for "
+                "install/scaffold/test requests; do not signal done before attempting the "
+                "command when the task requires a CLI.\n"
+            )
+        elif am == "explore":
+            mode_ctrl = (
+                "Control plane: agent_mode=explore — use search/read_file/symbols before "
+                "heavy edits or shell.\n"
+            )
+        elif am == "chat":
+            mode_ctrl = (
+                "Control plane: agent_mode=chat — answer concisely; use tools only when "
+                "the task clearly needs repo evidence.\n"
+            )
 
         user_block = (
             f"User task: {q}\n"
+            f"{mode_ctrl}"
             f"{scaffold_shell_hint(q)}"
             f"{edit_extra}"
             f"{hint_extra}"
             f"{shell_mem}"
+            f"{shell_rec}"
             f"{_exploration_hint(i, max_steps, intent)}\n"
             f"{summary_note}"
             f"Router hint: tool={router!r} confidence={rconf:.2f}\n"
@@ -1029,7 +1222,7 @@ async def run_reasoning_loop(
         _scaf = scaffold_shell_hint(str(q)).strip()
         if (
             _scaf
-            and max_steps >= 2
+            and max_steps >= 1
             and not bool(state.get("react_low_signal_repo_probe"))
         ):
             premature = (
@@ -1038,42 +1231,92 @@ async def run_reasoning_loop(
                 or str(step.get("action") or "").strip().lower() == "done"
             )
             if premature:
+                ws_root = getattr(registry, "workspace_root", "") or ""
+                cmd0 = infer_scaffold_shell_command(str(q))
+                sparse = _workspace_sparse_for_scaffold(ws_root, settings)
                 if i == 0:
-                    state["react_observations"].append(
-                        "Scaffold request: model tried to finish without tools — "
-                        "listing workspace first."
-                    )
-                    step = {
-                        "thought": "Scaffold request — inspect workspace before CLI.",
-                        "tool": "file",
-                        "action": "list_dir",
-                        "args": {"path": ".", "depth": 2},
-                        "done": False,
-                    }
-                elif i == 1:
-                    cmd = infer_scaffold_shell_command(str(q))
-                    if shell_ok and cmd:
+                    ex_first = am == "execute" and shell_ok and bool(cmd0)
+                    if ex_first:
                         state["react_observations"].append(
-                            "Scaffold request: running scaffold CLI (confirm in UI if prompted)."
+                            "Execute mode: scaffold — running CLI first (confirm in UI)."
                         )
+                        state["_scaffold_opened_shell_early"] = True
                         step = {
-                            "thought": "Run the scaffold command the user asked for.",
+                            "thought": "Execute mode — run scaffold CLI immediately.",
                             "tool": "shell",
                             "action": "run_command",
                             "args": {
-                                "command": cmd,
+                                "command": cmd0,
+                                "title": "Scaffold project",
+                            },
+                            "done": False,
+                        }
+                    elif sparse and shell_ok and cmd0:
+                        state["react_observations"].append(
+                            "Scaffold request: sparse workspace — running scaffold CLI "
+                            "directly (confirm in UI if prompted)."
+                        )
+                        state["_scaffold_opened_shell_early"] = True
+                        step = {
+                            "thought": "Sparse workspace — run scaffold CLI without list_dir.",
+                            "tool": "shell",
+                            "action": "run_command",
+                            "args": {
+                                "command": cmd0,
                                 "title": "Scaffold project",
                             },
                             "done": False,
                         }
                     else:
+                        state["react_observations"].append(
+                            "Scaffold request: model tried to finish without tools — "
+                            "listing workspace first."
+                        )
                         step = {
-                            "thought": "Search workspace for relevant files.",
+                            "thought": "Scaffold request — inspect workspace before CLI.",
                             "tool": "file",
-                            "action": "search",
-                            "args": {"query": str(q)[:100]},
+                            "action": "list_dir",
+                            "args": {"path": ".", "depth": 2},
                             "done": False,
                         }
+                elif i == 1:
+                    if state.get("_scaffold_opened_shell_early"):
+                        state["react_observations"].append(
+                            "Scaffold: verify generated files (package.json, src, etc.)."
+                        )
+                        step = {
+                            "thought": "Verify scaffold output in the workspace.",
+                            "tool": "file",
+                            "action": "list_dir",
+                            "args": {"path": ".", "depth": 3},
+                            "done": False,
+                        }
+                        state.pop("_scaffold_opened_shell_early", None)
+                    else:
+                        cmd = infer_scaffold_shell_command(str(q))
+                        if shell_ok and cmd:
+                            state["react_observations"].append(
+                                "Scaffold request: running scaffold CLI "
+                                "(confirm in UI if prompted)."
+                            )
+                            step = {
+                                "thought": "Run the scaffold command the user asked for.",
+                                "tool": "shell",
+                                "action": "run_command",
+                                "args": {
+                                    "command": cmd,
+                                    "title": "Scaffold project",
+                                },
+                                "done": False,
+                            }
+                        else:
+                            step = {
+                                "thought": "Search workspace for relevant files.",
+                                "tool": "file",
+                                "action": "search",
+                                "args": {"query": str(q)[:100]},
+                                "done": False,
+                            }
 
         state["react_steps"].append(
             {
@@ -1086,7 +1329,42 @@ async def run_reasoning_loop(
         )
         _maybe_compress_react_state(state)
 
-        if step.get("done") or step.get("action") == "done" or not step.get("tool"):
+        done_like = (
+            step.get("done")
+            or str(step.get("action") or "").strip().lower() == "done"
+            or not step.get("tool")
+        )
+        if done_like and am == "execute" and _scaf and shell_ok:
+            cmd_gate = infer_scaffold_shell_command(str(q))
+            shell_ran = any(
+                isinstance(x, dict) and str(x.get("tool") or "").lower() == "shell"
+                for x in (state.get("react_steps") or [])
+            )
+            if cmd_gate and not shell_ran:
+                state["react_observations"].append(
+                    "Execute mode: blocked premature done — running scaffold shell."
+                )
+                step = {
+                    "thought": "Execute mode — scaffold requires shell.run_command.",
+                    "tool": "shell",
+                    "action": "run_command",
+                    "args": {
+                        "command": cmd_gate,
+                        "title": "Scaffold project",
+                    },
+                    "done": False,
+                }
+                state["react_steps"][-1] = {
+                    "step_index": i,
+                    "thought": step.get("thought"),
+                    "tool": step.get("tool"),
+                    "action": step.get("action"),
+                    "args": step.get("args"),
+                }
+                _maybe_compress_react_state(state)
+                done_like = False
+
+        if done_like:
             logger.info("ReasoningLoop: planner signaled done at step %s", i)
             state["react_early_stop_reason"] = "planner_done"
             await _emit_react(
@@ -1346,8 +1624,14 @@ async def run_reasoning_loop(
             timed = "timed out" in err_s or "timeout" in err_s
             futile = _shell_retry_pointless(res)
             if futile:
+                alt = ""
+                cmd_try = str(args.get("command") or "").lower()
+                if "create-react-app" in cmd_try:
+                    alt = (
+                        " Alternative: `npm create vite@latest my-app -- --template react`."
+                    )
                 state["react_observations"].append(
-                    f"Step {i}: shell failed (no retry — error looks non-transient)"
+                    f"Step {i}: shell failed (no retry — error looks non-transient).{alt}"
                 )
             if not skip_like and not no_cb and not timed and not futile:
                 state["react_observations"].append(
@@ -1379,6 +1663,26 @@ async def run_reasoning_loop(
                 }
             )
             state["last_shell_commands"] = lst[-12:]
+            if not res.success:
+                rh = _shell_failure_recovery_hints(lst[-1])
+                state["react_observations"].append(
+                    f"Step {i}: shell recovery hint — {rh}"
+                )
+            elif scaffold_shell_hint(str(q)).strip():
+                cmd_l = cmd_s.lower()
+                if any(
+                    k in cmd_l
+                    for k in (
+                        "create-react-app",
+                        "create vite",
+                        "create-vite",
+                        "create-next-app",
+                    )
+                ):
+                    state["react_observations"].append(
+                        "Scaffold shell exited 0 — use list_dir or read_file to confirm "
+                        "package.json / src exist before declaring done."
+                    )
 
         useful = _tool_step_useful(res, q)
         if res and res.success and tool_name == "file_edit":

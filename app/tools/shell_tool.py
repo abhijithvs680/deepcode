@@ -16,6 +16,7 @@ from app.agents.shell_allowlist import (
 )
 from app.agents.shell_command_classify import classify_shell_risk, shell_risk_label
 from app.core.config import get_settings
+from app.core.event_bus import EventBus
 from app.tools.base_tool import Tool, ToolResult
 
 logger = logging.getLogger(__name__)
@@ -154,6 +155,18 @@ class ShellTool(Tool):
                     retryable=True,
                     data={"risk": risk},
                 )
+            try:
+                await EventBus.emit(
+                    {
+                        "type": "shell_command_proposed",
+                        "command": cmd,
+                        "cwd": run_cwd,
+                        "title": title or "",
+                        "risk": risk,
+                    }
+                )
+            except Exception:
+                pass
             exact_cands, prefix_cands = suggest_allowlist_tokens(cmd)
             tag_labels = list(dict.fromkeys(exact_cands + prefix_cands))
             choice = await invoke_confirm_shell_callback(

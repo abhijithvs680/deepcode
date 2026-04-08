@@ -591,6 +591,7 @@ class DeepCodeIdeApp(App):
         return adds, dels
 
     def _editor_markup(self) -> str:
+        self.ide_state.ensure_active_file_fallback()
         af = self.ide_state.active_file
         if not af:
             return "[dim]Open a file via agent read_file or explorer.[/dim]"

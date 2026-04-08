@@ -2,7 +2,8 @@
 Mutable IDE runtime state for DeepCode V2 (agent IDE). Updated from EventBus + orchestrator meta.
 
 Event types: agent_file_open, diff_ready, file_updated, agent_status, final_answer,
-  subgoal_start, subgoal_complete, state, rag_*, cycle_*, task_*, goal_complete
+  shell_command_proposed, subgoal_start, subgoal_complete, state, rag_*, cycle_*,
+  task_*, goal_complete
 """
 from __future__ import annotations
 
@@ -71,6 +72,13 @@ class IDEState:
 
     terminal_log: list[str] = field(default_factory=list)
     max_terminal_lines: int = 500
+    # Latest shell the agent is about to run (after shell_command_proposed event).
+    pending_shell_proposal: dict[str, Any] | None = None
+
+    def ensure_active_file_fallback(self) -> None:
+        """If nothing is focused but we have open tabs, show the most recent tab."""
+        if (not (self.active_file or "").strip()) and self.open_files:
+            self.active_file = str(self.open_files[-1]).replace("\\", "/")
 
     def log(self, line: str) -> bool:
         """Append a terminal line; returns True if oldest lines were dropped."""
@@ -152,6 +160,13 @@ class IDEState:
         t = event.get("type")
         if t == "final_answer":
             return
+        if t == "shell_command_proposed":
+            self.pending_shell_proposal = {
+                "command": str(event.get("command") or "")[:800],
+                "cwd": str(event.get("cwd") or "")[:400],
+                "title": str(event.get("title") or "")[:120],
+                "risk": str(event.get("risk") or ""),
+            }
         if t == "fast_path":
             r = str(event.get("reason") or "trivial_query")
             q = str(event.get("query") or "")[:160]
@@ -276,6 +291,8 @@ class IDEState:
                 ms = event.get("duration_ms")
                 if ms is not None:
                     row["duration_ms"] = ms
+                if str(tool).lower() == "shell":
+                    self.pending_shell_proposal = None
             else:
                 ap = event.get("args_preview")
                 if ap:
@@ -454,6 +471,15 @@ class IDEState:
     def run_events_panel_text(self) -> str:
         """Status + compact tool trace for inline chat (below assistant message)."""
         lines = [self.status_bar_text()]
+        psp = self.pending_shell_proposal
+        if isinstance(psp, dict) and psp.get("command"):
+            cq = rich_escape(str(psp["command"])[:220])
+            cwd = str(psp.get("cwd") or "").strip()
+            cwd_s = f"  [dim]cwd {rich_escape(cwd[:100])}[/dim]" if cwd else ""
+            lines.append(
+                f"[yellow]●[/yellow] [bold]$[/bold] {cq}{cwd_s}  "
+                "[dim](confirm in dialog)[/dim]"
+            )
         tail: list[str] = []
         for ev in self.trace_events[-8:]:
             if not isinstance(ev, dict):

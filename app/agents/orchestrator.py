@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.confirm_diff_util import invoke_confirm_diff_callback
 from app.agents.context_builder import ContextBuilder
+from app.agents.react_grounding import derive_agent_mode
 from app.core.config import get_settings
 from app.core.interaction_logger import InteractionLogger
 from app.core.logger import get_logger
@@ -505,6 +506,7 @@ class AgentOrchestrator:
             "next_subgoal_bias": [],
             "active_working_set": [],
             "long_run_mode": bool(kwargs.get("long_run_mode")),
+            "agent_mode": derive_agent_mode(question),
         }
         for _cb_key in (
             "stream_callback",
@@ -557,7 +559,10 @@ class AgentOrchestrator:
             )
             cls_c0 = float(classification.get("confidence", 1.0) or 1.0)
             if mode == "ask" and cls_c0 < low_sig_thr:
-                if looks_like_repo_exploration_query(question):
+                if (
+                    looks_like_repo_exploration_query(question)
+                    and str(state.get("agent_mode") or "chat") != "execute"
+                ):
                     state["react_low_signal_repo_probe"] = True
                     state["react_probe_max_steps"] = low_signal_probe_max_steps(
                         self.settings,

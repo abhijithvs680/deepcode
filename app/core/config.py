@@ -112,6 +112,12 @@ class Settings(BaseSettings):
     REACT_EXEC_UNLOCK_MIN_SYMBOLS: int = 2
     REACT_EXEC_UNLOCK_MIN_CONFIDENCE: float = 0.5
     REACT_EXEC_UNLOCK_MIN_GOAL_PROGRESS: float = 0.35
+    # When grounding is weak (few reads, no symbols, low confidence), require this many
+    # distinct file reads before execution unlock (blocks “two random files → shell”).
+    REACT_EXEC_WEAK_GROUNDING_MIN_FILES: int = 3
+    # Scaffold: skip forced list_dir when workspace has at most this many non-hidden
+    # entries (after ignoring .git, .deepcode, node_modules, etc.).
+    REACT_SCAFFOLD_SPARSE_DIR_MAX_ENTRIES: int = 4
     # Re-run the same shell invocation once on hard failure (not skip / no-UI / timeout).
     REACT_SHELL_FAILURE_RETRY_ONCE: bool = True
 
@@ -119,7 +125,10 @@ class Settings(BaseSettings):
     REACT_AGENT_ENABLED: bool = True
     REACT_MAX_STEPS: int = 5
     # When exploration confidence is low, ReAct may use up to this many steps
-    REACT_MAX_STEPS_CAP: int = 7
+    REACT_MAX_STEPS_CAP: int = 5
+    # Hard caps by control-plane agent_mode (reasoning_loop)
+    REACT_MAX_STEPS_EXECUTE_MODE: int = 3
+    REACT_MAX_STEPS_CHAT_MODE: int = 2
     # One ReAct loop per heuristic subgoal, then merge context (single subgoal = prior behavior)
     HIERARCHICAL_REACT_ENABLED: bool = True
     # After 2+ subgoals, re-run cross-subgoal synthesis to bias remaining subgoal order
