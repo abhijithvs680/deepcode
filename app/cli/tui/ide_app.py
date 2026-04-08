@@ -426,27 +426,65 @@ class DeepCodeIdeApp(App):
         except Exception:
             pass
 
+    @staticmethod
+    def _explorer_body_scroll(body: Container) -> VerticalScroll | None:
+        for c in body.children:
+            if getattr(c, "id", None) == "ide-explorer-scroll" and isinstance(
+                c, VerticalScroll
+            ):
+                return c
+        return None
+
+    @staticmethod
+    def _explorer_body_tree(body: Container) -> DirectoryTree | None:
+        for c in body.children:
+            if getattr(c, "id", None) == "ide-explorer-tree" and isinstance(
+                c, DirectoryTree
+            ):
+                return c
+        return None
+
     def _setup_explorer_workspace_tree(self) -> None:
-        """Idempotent: one DirectoryTree (if repo) + one context VerticalScroll — safe across reloads."""
+        """Single scroll + optional tree: reuse widgets, update tree.path on repo change (no remove_children race)."""
         try:
             body = self.query_one("#ide-explorer-body", Container)
         except Exception:
             return
-        body.remove_children()
+
+        scroll = self._explorer_body_scroll(body)
+        if scroll is None:
+            scroll = VerticalScroll(id="ide-explorer-scroll")
+            body.mount(scroll)
+
+        tree = self._explorer_body_tree(body)
         rp = (self._repo_path or "").strip()
+
         if not rp:
-            body.mount(VerticalScroll(id="ide-explorer-scroll"))
+            if tree is not None:
+                tree.remove()
             return
+
         try:
             root = Path(rp).expanduser().resolve()
         except OSError:
-            body.mount(VerticalScroll(id="ide-explorer-scroll"))
+            if tree is not None:
+                tree.remove()
             return
+
+        if tree is None:
+            try:
+                nt = DirectoryTree(root, id="ide-explorer-tree")
+            except OSError:
+                return
+            body.mount(nt, before=scroll)
+            return
+
         try:
-            body.mount(DirectoryTree(root, id="ide-explorer-tree"))
+            cur = Path(tree.path).resolve()
         except OSError:
-            pass
-        body.mount(VerticalScroll(id="ide-explorer-scroll"))
+            cur = None
+        if cur != root:
+            tree.path = root
 
     @on(DirectoryTree.FileSelected)
     def on_directory_tree_file_selected(self, event: DirectoryTree.FileSelected) -> None:
