@@ -33,6 +33,9 @@ from app.core.config import get_settings
 
 settings = get_settings()
 
+# RichLog intro line; used for idempotent detection (see `_shell_intro_once`).
+_SHELL_INTRO_MARK = "Interactive shell"
+
 
 def _normalize_unified_diff_header_path(token: str) -> str | None:
     t = token.strip().split("\t", 1)[0].strip()
@@ -457,10 +460,8 @@ class DeepCodeIdeApp(App):
         if self._repo_path:
             self.sub_title = f"{settings.LLM_MODEL} | {Path(self._repo_path).name}"
         self._dispose_shell_worker()
-        self._shell_intro_written = False
         self._setup_explorer_workspace_tree()
         self._mount_chat(chatfmt.ingest_ready_banner())
-        self._shell_intro_once()
         self._refresh_all_panels()
         try:
             self.query_one("#ide-shell-prompt", ShellPromptLine).refresh_tip()
@@ -566,6 +567,12 @@ class DeepCodeIdeApp(App):
 
     @work(exclusive=True, group="shell_reset")
     async def _dispose_shell_worker(self) -> None:
+        """Stop subprocess shell worker; does **not** clear `#ide-shell-out` RichLog.
+
+        Policy: repo change / shell restart → do **not** append another intro line.
+        Only after an explicit `RichLog.clear()` should `_shell_intro_written` be reset
+        and `_shell_intro_once()` run again (flag reset without clearing the log duplicates lines).
+        """
         if self._ide_shell is not None:
             await self._ide_shell.stop()
         self._ide_shell = None
@@ -670,6 +677,15 @@ class DeepCodeIdeApp(App):
         )
         for ev in batch:
             self.ide_state.apply_event(ev)
+        active_rel = (self.ide_state.active_file or "").replace("\\", "/").strip()
+        if active_rel:
+            for ev in batch:
+                if ev.get("type") != "file_updated":
+                    continue
+                fp = str(ev.get("file") or "").replace("\\", "/").strip()
+                if fp == active_rel:
+                    self._editor_reload_after_agent_write_if_not_dirty()
+                    break
         self.call_next(self._refresh_all_panels)
 
     def _chat_scroll(self) -> VerticalScroll:
@@ -974,11 +990,26 @@ class DeepCodeIdeApp(App):
         self._chat_scroll().remove_children()
         self._active_run_events_static = None
 
+    @staticmethod
+    def _richlog_already_has_shell_intro(lg: RichLog) -> bool:
+        """True if rendered lines already contain the intro (guards against flag desync)."""
+        try:
+            for strip in lg.lines[:12]:
+                if strip.text and _SHELL_INTRO_MARK in strip.text:
+                    return True
+        except Exception:
+            return False
+        return False
+
     def _shell_intro_once(self) -> None:
+        """Idempotent: one dim intro line per UI log. Prefer `on_mount` only; do not reset the flag on repo apply."""
         if getattr(self, "_shell_intro_written", False):
             return
         try:
             lg = self.query_one("#ide-shell-out", RichLog)
+            if self._richlog_already_has_shell_intro(lg):
+                self._shell_intro_written = True
+                return
             lg.write(
                 "[dim]Interactive shell — click the prompt row below or Ctrl+Shift+T, "
                 "then type and press Enter (one line per run).[/dim]"
@@ -986,6 +1017,19 @@ class DeepCodeIdeApp(App):
             self._shell_intro_written = True
         except Exception:
             pass
+
+    def _editor_reload_after_agent_write_if_not_dirty(self) -> None:
+        """Agent updated the open file on disk — sync TextArea, or warn if buffer is dirty."""
+        if self._editor_dirty:
+            try:
+                self.notify(
+                    "File changed on disk while editing. Save, discard, or re-open to reload.",
+                    timeout=6,
+                )
+            except Exception:
+                pass
+            return
+        self._editor_synced_key = None
 
     def action_clear_chat(self) -> None:
         self._clear_chat_only()
@@ -1111,7 +1155,8 @@ class DeepCodeIdeApp(App):
             pass
         if not raw:
             return
-        mode = "ask"
+        repo_loaded = bool((self._repo_path or "").strip())
+        mode = "edit" if repo_loaded else "ask"
         auto_apply = False
         dry_run = False
         long_run = False
@@ -1448,6 +1493,20 @@ class DeepCodeIdeApp(App):
                             f"Note: early stop ({esr}) with weak file/symbol grounding."
                         )
                     )
+            if meta.get("fast_path"):
+                self._mount_chat(
+                    chatfmt.system_block(
+                        "[dim]Answer-only (fast path). Use /edit or /run for multi-step tools "
+                        "and file edits.[/dim]"
+                    )
+                )
+                try:
+                    self.notify(
+                        "Answer-only (fast path). Use /edit or /run to execute changes.",
+                        timeout=4,
+                    )
+                except Exception:
+                    pass
         self.call_next(self._refresh_all_panels)
 
         if meta and meta.get("long_run"):
