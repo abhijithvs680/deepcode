@@ -34,11 +34,11 @@ class CommandPaletteScreen(ModalScreen[str | None]):
     DEFAULT_CSS = """
     CommandPaletteScreen {
         align: center middle;
-        background: #1e1e1e 92%;
+        background: #1e1e1e;
     }
     #palette-container {
-        width: 60%;
-        max-width: 80;
+        width: 70%;
+        max-width: 100;
         min-width: 40;
         height: auto;
         max-height: 90%;
@@ -58,6 +58,7 @@ class CommandPaletteScreen(ModalScreen[str | None]):
     }
     OptionList > .option-list--option-highlighted {
         background: #094771;
+        color: #ffffff;
     }
     """
 

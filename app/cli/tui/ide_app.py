@@ -17,7 +17,7 @@ from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll
-from textual.widgets import DirectoryTree, Footer, Header, RichLog, Static
+from textual.widgets import DirectoryTree, Footer, Header, RichLog, Static, TextArea
 
 from app.cli.tui.widgets.ide_composer import IdeComposer
 
@@ -83,6 +83,18 @@ class DeepCodeIdeApp(App):
             "ctrl+shift+t",
             "focus_shell_prompt",
             "Shell",
+            show=True,
+        ),
+        Binding(
+            "ctrl+shift+down",
+            "terminal_larger",
+            "Taller terminal",
+            show=True,
+        ),
+        Binding(
+            "ctrl+shift+up",
+            "terminal_smaller",
+            "Shorter terminal",
             show=True,
         ),
         Binding("ctrl+i", "next_tab", "Next tab", show=True),
@@ -164,9 +176,8 @@ class DeepCodeIdeApp(App):
         border: none;
     }
     #ide-terminal-stack {
-        height: 12;
-        min-height: 6;
-        max-height: 22;
+        min-height: 5;
+        max-height: 30;
         layout: vertical;
         border-top: solid #2a2a2a;
         padding: 0 1;
@@ -192,9 +203,15 @@ class DeepCodeIdeApp(App):
         layout: vertical;
         background: transparent;
     }
+    #ide-explorer-tree-container {
+        height: 1fr;
+        min-height: 6;
+        layout: vertical;
+        background: transparent;
+    }
     #ide-explorer-tree {
-        height: 2fr;
-        min-height: 8;
+        height: 1fr;
+        min-height: 6;
         padding: 0;
         background: transparent;
         color: #bbbbbb;
@@ -232,18 +249,26 @@ class DeepCodeIdeApp(App):
     }
     #ide-editor-body {
         height: 1fr;
-        padding: 1 2;
+        padding: 0;
         background: #1e1e1e;
         color: #e6e6e6;
     }
-    #ide-editor-body Static.chat-line {
+    #ide-editor {
+        height: 1fr;
+        min-height: 6;
+        background: #1e1e1e;
         color: #e6e6e6;
+        border: none;
+        padding: 1 2;
     }
     #ide-explorer-scroll {
-        height: 1fr;
-        min-height: 4;
+        height: 12;
+        min-height: 6;
+        max-height: 18;
         padding: 0;
         background: transparent;
+        border-top: solid #2a2a2a;
+        color: #aaaaaa;
     }
     Static.ide-chat-events {
         padding: 0 1 0 1;
@@ -325,6 +350,11 @@ class DeepCodeIdeApp(App):
         self._shell_intro_written = False
         self._active_run_events_static: Static | None = None
         self._explorer_setup_busy = False
+        self._explorer_setup_pending = False
+        self._terminal_height = 12
+        self._editor_dirty = False
+        self._editor_synced_key: tuple[str, str] | None = None
+        self._editor_suppress_changed = False
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -346,7 +376,14 @@ class DeepCodeIdeApp(App):
                     with Vertical(id="ide-editor-stack"):
                         yield Static("", id="ide-editor-tabs")
                         yield Static("", id="ide-editor-path")
-                        yield VerticalScroll(id="ide-editor-body")
+                        with VerticalScroll(id="ide-editor-body"):
+                            yield TextArea(
+                                "",
+                                id="ide-editor",
+                                read_only=False,
+                                show_line_numbers=True,
+                                soft_wrap=True,
+                            )
                     with Vertical(id="ide-terminal-stack"):
                         if self._ide_debug:
                             yield Static("Debug", classes="ide-ribbon-label")
@@ -369,7 +406,9 @@ class DeepCodeIdeApp(App):
                 with Vertical(id="ide-right", classes="ide-sidebar"):
                     with Vertical(id="ide-explorer-col"):
                         yield Static("Explorer", classes="ide-ribbon-label")
-                        yield Container(id="ide-explorer-body")
+                        with Vertical(id="ide-explorer-body"):
+                            yield Container(id="ide-explorer-tree-container")
+                            yield VerticalScroll(id="ide-explorer-scroll")
                         yield Static("Task", classes="ide-ribbon-label")
                         yield VerticalScroll(id="ide-subgoals-scroll")
         yield Footer()
@@ -398,6 +437,7 @@ class DeepCodeIdeApp(App):
             pass
         self._shell_intro_once()
         self._setup_explorer_workspace_tree()
+        self._apply_terminal_height_style()
         self.push_screen(IngestionLoaderScreen(self.raw_repo_input))
 
     def on_unmount(self) -> None:
@@ -428,24 +468,10 @@ class DeepCodeIdeApp(App):
             pass
 
     @staticmethod
-    def _explorer_one_scroll(body: Container) -> VerticalScroll | None:
-        """Return the single #ide-explorer-scroll; remove any duplicate ids (legacy / race recovery)."""
+    def _explorer_dedupe_trees_in_container(tcont: Container) -> DirectoryTree | None:
         found = [
             c
-            for c in body.children
-            if getattr(c, "id", None) == "ide-explorer-scroll"
-            and isinstance(c, VerticalScroll)
-        ]
-        for extra in found[1:]:
-            extra.remove()
-        return found[0] if found else None
-
-    @staticmethod
-    def _explorer_one_tree(body: Container) -> DirectoryTree | None:
-        """Return the single #ide-explorer-tree; remove duplicates."""
-        found = [
-            c
-            for c in body.children
+            for c in tcont.children
             if getattr(c, "id", None) == "ide-explorer-tree"
             and isinstance(c, DirectoryTree)
         ]
@@ -454,31 +480,22 @@ class DeepCodeIdeApp(App):
         return found[0] if found else None
 
     def _setup_explorer_workspace_tree(self) -> None:
-        """Single scroll + optional tree: dedupe children, registry lookup, then mount only if missing."""
+        """Tree in top container; AI context scroll is compose-time (bottom). Coalesced retry."""
         if self._explorer_setup_busy:
-            self.call_next(self._setup_explorer_workspace_tree)
+            self._explorer_setup_pending = True
             return
         self._explorer_setup_busy = True
         try:
             try:
-                body = self.query_one("#ide-explorer-body", Container)
+                body = self.query_one("#ide-explorer-body", Vertical)
+                tcont = self.query_one("#ide-explorer-tree-container", Container)
             except Exception:
                 return
 
-            self._explorer_one_scroll(body)
-            scroll: VerticalScroll | None = None
-            try:
-                scroll = body.query_one("#ide-explorer-scroll", VerticalScroll)
-            except Exception:
-                scroll = None
-            if scroll is None:
-                scroll = VerticalScroll(id="ide-explorer-scroll")
-                body.mount(scroll)
-
-            self._explorer_one_tree(body)
+            self._explorer_dedupe_trees_in_container(tcont)
             tree: DirectoryTree | None = None
             try:
-                tree = body.query_one("#ide-explorer-tree", DirectoryTree)
+                tree = tcont.query_one("#ide-explorer-tree", DirectoryTree)
             except Exception:
                 tree = None
 
@@ -501,7 +518,15 @@ class DeepCodeIdeApp(App):
                     nt = DirectoryTree(root, id="ide-explorer-tree")
                 except OSError:
                     return
-                body.mount(nt, before=scroll)
+                assert (
+                    sum(
+                        1
+                        for c in tcont.children
+                        if getattr(c, "id", None) == "ide-explorer-tree"
+                    )
+                    == 0
+                )
+                tcont.mount(nt)
                 return
 
             try:
@@ -512,6 +537,9 @@ class DeepCodeIdeApp(App):
                 tree.path = root
         finally:
             self._explorer_setup_busy = False
+            if self._explorer_setup_pending:
+                self._explorer_setup_pending = False
+                self.call_next(self._setup_explorer_workspace_tree)
 
     @on(DirectoryTree.FileSelected)
     def on_directory_tree_file_selected(self, event: DirectoryTree.FileSelected) -> None:
@@ -543,11 +571,28 @@ class DeepCodeIdeApp(App):
         self._ide_shell = None
         self._shell_cwd = None
 
+    def _apply_terminal_height_style(self) -> None:
+        try:
+            term = self.query_one("#ide-terminal-stack", Vertical)
+            term.styles.height = self._terminal_height
+        except Exception:
+            pass
+
+    def action_terminal_larger(self) -> None:
+        self._terminal_height = min(self._terminal_height + 2, 30)
+        self._apply_terminal_height_style()
+
+    def action_terminal_smaller(self) -> None:
+        self._terminal_height = max(self._terminal_height - 2, 5)
+        self._apply_terminal_height_style()
+
     def action_toggle_bottom_visibility(self) -> None:
         self._flush_ide_events()
         term = self.query_one("#ide-terminal-stack", Vertical)
         self._bottom_visible = not self._bottom_visible
         term.set_class(not self._bottom_visible, "hidden")
+        if self._bottom_visible:
+            self._apply_terminal_height_style()
 
     def action_focus_shell_prompt(self) -> None:
         self._flush_ide_events()
@@ -598,18 +643,22 @@ class DeepCodeIdeApp(App):
 
     def action_copy_editor(self) -> None:
         diff = self._resolve_diff_raw_for_active()
-        if diff:
+        if diff and self.ide_state.diff_mode:
             ok = copy_plain_text(diff[:500_000])
         else:
-            p = self._active_file_path()
             ok = False
-            if p is not None and p.is_file():
-                try:
-                    ok = copy_plain_text(
-                        p.read_text(encoding="utf-8", errors="replace")[:500_000]
-                    )
-                except OSError:
-                    ok = False
+            try:
+                ta = self.query_one("#ide-editor", TextArea)
+                ok = copy_plain_text(ta.text[:500_000])
+            except Exception:
+                p = self._active_file_path()
+                if p is not None and p.is_file():
+                    try:
+                        ok = copy_plain_text(
+                            p.read_text(encoding="utf-8", errors="replace")[:500_000]
+                        )
+                    except OSError:
+                        ok = False
         if ok:
             self._mount_chat(chatfmt.system_block("Editor content copied (plain text)."))
         else:
@@ -674,14 +723,11 @@ class DeepCodeIdeApp(App):
                         diff_raw=diff_raw,
                     )
                 )
-                ed = self.query_one("#ide-editor-body", VerticalScroll)
-                ed.remove_children()
-                body = self._editor_markup()
-                ed.mount(Static(body, classes="chat-line"))
+                self._sync_editor_textarea()
                 if getattr(self, "_ide_focus_editor_after_refresh", False):
                     self._ide_focus_editor_after_refresh = False
                     try:
-                        ed.focus()
+                        self.query_one("#ide-editor", TextArea).focus()
                     except Exception:
                         pass
             except Exception:
@@ -735,18 +781,6 @@ class DeepCodeIdeApp(App):
             return cand if cand.is_file() else None
         except (OSError, ValueError):
             return None
-
-    @staticmethod
-    def _diff_line_markup(line: str) -> str:
-        if line.startswith("+") and not line.startswith("+++"):
-            return f"[green]{escape(line)}[/green]"
-        if line.startswith("-") and not line.startswith("---"):
-            return f"[red]{escape(line)}[/red]"
-        if line.startswith("@@"):
-            return f"[cyan]{escape(line)}[/cyan]"
-        if line.startswith("--- ") or line.startswith("+++ "):
-            return f"[yellow]{escape(line)}[/yellow]"
-        return f"[dim]{escape(line)}[/dim]"
 
     @staticmethod
     def _diff_plus_minus(diff: str) -> tuple[int, int]:
@@ -812,32 +846,123 @@ class DeepCodeIdeApp(App):
             return "[dim]—[/dim]"
         return self._breadcrumb_markup(af)
 
-    def _editor_markup(self) -> str:
+    def _editor_view_key(self) -> tuple[str, str]:
+        self.ide_state.ensure_active_file_fallback()
+        af = (self.ide_state.active_file or "").strip()
+        dr = self._resolve_diff_raw_for_active()
+        if self.ide_state.diff_mode and dr:
+            return (af, "diff")
+        return (af, "file")
+
+    def _editor_buffer_read_only(self) -> bool:
+        dr = self._resolve_diff_raw_for_active()
+        if self.ide_state.diff_mode and dr:
+            return True
+        return not (self.ide_state.active_file or "").strip()
+
+    def _editor_plain_content(self) -> str:
         self.ide_state.ensure_active_file_fallback()
         af = self.ide_state.active_file
         if not af:
             return (
-                "[dim]No file open — use Explorer (tree), agent read_file, or run a task.[/dim]"
+                "No file open — use Explorer (tree), agent read_file, or run a task."
             )
-        if self.ide_state.diff_mode:
-            diff = self._resolve_diff_raw_for_active()
-            if diff:
-                lines = diff[:14000].splitlines()
-                return "\n".join(self._diff_line_markup(L) for L in lines[:500])
+        dr = self._resolve_diff_raw_for_active()
+        if self.ide_state.diff_mode and dr:
+            lines = dr[:14000].splitlines()
+            return "\n".join(lines[:500])
         fp = self._active_file_path()
         if fp is None:
             root = self._repo_path or ""
             if not root:
-                return escape(af)
-            return f"[dim]{escape(af)} — not on disk or outside repo root[/dim]"
+                return str(af)
+            return f"{af} — not on disk or outside repo root"
         try:
             text = fp.read_text(encoding="utf-8", errors="replace")
         except OSError as e:
-            return f"[red]{escape(str(e))}[/red]"
+            return str(e)
         cap = text[:24000]
         if len(text) > 24000:
-            cap += "\n\n[dim]… truncated …[/dim]"
-        return escape(cap)
+            cap += "\n\n… truncated …"
+        return cap
+
+    @staticmethod
+    def _language_for_path(rel: str) -> str:
+        ext = Path(rel.replace("\\", "/")).suffix.lower()
+        m: dict[str, str] = {
+            ".py": "python",
+            ".rs": "rust",
+            ".js": "javascript",
+            ".ts": "typescript",
+            ".tsx": "typescript",
+            ".jsx": "javascript",
+            ".go": "go",
+            ".md": "markdown",
+            ".json": "json",
+            ".yaml": "yaml",
+            ".yml": "yaml",
+            ".toml": "toml",
+            ".html": "html",
+            ".css": "css",
+            ".sh": "bash",
+            ".bash": "bash",
+        }
+        return m.get(ext, "")
+
+    def _apply_editor_language(self, ta: TextArea) -> None:
+        if not hasattr(ta, "language"):
+            return
+        af = (self.ide_state.active_file or "").strip()
+        if not af or af == "_session" or self._editor_buffer_read_only():
+            try:
+                ta.language = ""
+            except Exception:
+                pass
+            return
+        lang = self._language_for_path(af)
+        try:
+            ta.language = lang or ""
+        except Exception:
+            pass
+
+    def _sync_editor_textarea(self) -> None:
+        try:
+            ta = self.query_one("#ide-editor", TextArea)
+        except Exception:
+            return
+        key = self._editor_view_key()
+        ro = self._editor_buffer_read_only()
+        if (
+            key == self._editor_synced_key
+            and self._editor_dirty
+            and not ro
+        ):
+            ta.read_only = ro
+            self._apply_editor_language(ta)
+            return
+        plain = self._editor_plain_content()
+        self._editor_suppress_changed = True
+        try:
+            ta.text = plain
+            ta.read_only = ro
+            self._apply_editor_language(ta)
+        finally:
+            self._editor_suppress_changed = False
+        self._editor_synced_key = key
+        self._editor_dirty = False
+
+    @on(TextArea.Changed)
+    def on_ide_editor_changed(self, event: TextArea.Changed) -> None:
+        ta = getattr(event, "text_area", None) or getattr(event, "control", None)
+        if getattr(ta, "id", None) != "ide-editor":
+            return
+        if self._editor_suppress_changed:
+            return
+        try:
+            if not ta.read_only:
+                self._editor_dirty = True
+        except Exception:
+            pass
 
     def _mount_chat(self, markup: str) -> Static:
         w = Static(markup, classes="chat-line")
@@ -1044,8 +1169,8 @@ class DeepCodeIdeApp(App):
             self._mount_chat(
                 chatfmt.system_block(
                     "IDE: /help /metrics /clear /browse /repo /run /edit /plan …\n"
-                    "Ctrl+P palette  |  Ctrl+B terminal panel  |  Ctrl+Shift+T shell prompt  |  "
-                    "Ctrl+I tab  |  Ctrl+W close tab  |  Ctrl+L clear chat  |  "
+                    "Ctrl+P palette  |  Ctrl+B terminal panel  |  Ctrl+Shift+↑/↓ terminal height  |  "
+                    "Ctrl+Shift+T shell prompt  |  Ctrl+I tab  |  Ctrl+W close tab  |  Ctrl+L clear chat  |  "
                     "Ctrl+Shift+E/D copy explorer / editor"
                 )
             )
