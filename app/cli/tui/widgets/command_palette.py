@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical
+from textual.containers import Container
 from textual.screen import ModalScreen
 from textual.widgets import Label, OptionList
 
@@ -34,28 +34,39 @@ class CommandPaletteScreen(ModalScreen[str | None]):
     DEFAULT_CSS = """
     CommandPaletteScreen {
         align: center middle;
+        background: #1e1e1e 92%;
     }
-    #palette-box {
-        width: 64;
+    #palette-container {
+        width: 60%;
+        max-width: 80;
+        min-width: 40;
         height: auto;
         max-height: 90%;
-        border: thick $primary;
-        background: $surface;
+        layout: vertical;
+        border: solid #3a3a3a;
+        background: #252526;
         padding: 1 2;
+    }
+    #palette-container Label {
+        color: #cccccc;
     }
     OptionList {
         width: 100%;
         height: auto;
         margin-top: 1;
+        background: transparent;
+    }
+    OptionList > .option-list--option-highlighted {
+        background: #094771;
     }
     """
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="palette-box"):
+        with Container(id="palette-container"):
             yield Label("Command palette — pick one (Esc to close)")
             yield OptionList(
                 *[f"{val} — {desc}" for val, desc in PALETTE_ENTRIES],
-                id="cmd_options"
+                id="cmd_options",
             )
 
     def on_mount(self) -> None:

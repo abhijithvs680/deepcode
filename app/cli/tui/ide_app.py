@@ -1,6 +1,6 @@
 """
 DeepCode V2 — agent IDE runtime (Textual): VS Code–style workspace — chat sidebar |
-editor (center) | explorer + subgoals (right); integrated terminal docked along the bottom.
+editor + terminal (stacked center column) | explorer + subgoals (right).
 
 Run: deepcode ui --ide [REPO]
 """
@@ -168,7 +168,7 @@ class DeepCodeIdeApp(App):
         min-height: 6;
         max-height: 22;
         layout: vertical;
-        border-top: solid #333333;
+        border-top: solid #2a2a2a;
         padding: 0 1;
         background: #202020;
     }
@@ -324,6 +324,7 @@ class DeepCodeIdeApp(App):
         )
         self._shell_intro_written = False
         self._active_run_events_static: Static | None = None
+        self._explorer_setup_busy = False
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -346,31 +347,31 @@ class DeepCodeIdeApp(App):
                         yield Static("", id="ide-editor-tabs")
                         yield Static("", id="ide-editor-path")
                         yield VerticalScroll(id="ide-editor-body")
+                    with Vertical(id="ide-terminal-stack"):
+                        if self._ide_debug:
+                            yield Static("Debug", classes="ide-ribbon-label")
+                            yield RichLog(
+                                id="ide-debug-trace",
+                                auto_scroll=True,
+                                wrap=True,
+                                markup=True,
+                            )
+                        yield RichLog(
+                            id="ide-shell-out",
+                            auto_scroll=True,
+                            wrap=True,
+                            markup=True,
+                        )
+                        yield ShellPromptLine(
+                            tip_fn=lambda: self._ide_shell_prompt_tip(),
+                            id="ide-shell-prompt",
+                        )
                 with Vertical(id="ide-right", classes="ide-sidebar"):
                     with Vertical(id="ide-explorer-col"):
                         yield Static("Explorer", classes="ide-ribbon-label")
                         yield Container(id="ide-explorer-body")
                         yield Static("Task", classes="ide-ribbon-label")
                         yield VerticalScroll(id="ide-subgoals-scroll")
-            with Vertical(id="ide-terminal-stack"):
-                if self._ide_debug:
-                    yield Static("Debug", classes="ide-ribbon-label")
-                    yield RichLog(
-                        id="ide-debug-trace",
-                        auto_scroll=True,
-                        wrap=True,
-                        markup=True,
-                    )
-                yield RichLog(
-                    id="ide-shell-out",
-                    auto_scroll=True,
-                    wrap=True,
-                    markup=True,
-                )
-                yield ShellPromptLine(
-                    tip_fn=lambda: self._ide_shell_prompt_tip(),
-                    id="ide-shell-prompt",
-                )
         yield Footer()
 
     def on_mount(self) -> None:
@@ -427,64 +428,90 @@ class DeepCodeIdeApp(App):
             pass
 
     @staticmethod
-    def _explorer_body_scroll(body: Container) -> VerticalScroll | None:
-        for c in body.children:
-            if getattr(c, "id", None) == "ide-explorer-scroll" and isinstance(
-                c, VerticalScroll
-            ):
-                return c
-        return None
+    def _explorer_one_scroll(body: Container) -> VerticalScroll | None:
+        """Return the single #ide-explorer-scroll; remove any duplicate ids (legacy / race recovery)."""
+        found = [
+            c
+            for c in body.children
+            if getattr(c, "id", None) == "ide-explorer-scroll"
+            and isinstance(c, VerticalScroll)
+        ]
+        for extra in found[1:]:
+            extra.remove()
+        return found[0] if found else None
 
     @staticmethod
-    def _explorer_body_tree(body: Container) -> DirectoryTree | None:
-        for c in body.children:
-            if getattr(c, "id", None) == "ide-explorer-tree" and isinstance(
-                c, DirectoryTree
-            ):
-                return c
-        return None
+    def _explorer_one_tree(body: Container) -> DirectoryTree | None:
+        """Return the single #ide-explorer-tree; remove duplicates."""
+        found = [
+            c
+            for c in body.children
+            if getattr(c, "id", None) == "ide-explorer-tree"
+            and isinstance(c, DirectoryTree)
+        ]
+        for extra in found[1:]:
+            extra.remove()
+        return found[0] if found else None
 
     def _setup_explorer_workspace_tree(self) -> None:
-        """Single scroll + optional tree: reuse widgets, update tree.path on repo change (no remove_children race)."""
+        """Single scroll + optional tree: dedupe children, registry lookup, then mount only if missing."""
+        if self._explorer_setup_busy:
+            self.call_next(self._setup_explorer_workspace_tree)
+            return
+        self._explorer_setup_busy = True
         try:
-            body = self.query_one("#ide-explorer-body", Container)
-        except Exception:
-            return
-
-        scroll = self._explorer_body_scroll(body)
-        if scroll is None:
-            scroll = VerticalScroll(id="ide-explorer-scroll")
-            body.mount(scroll)
-
-        tree = self._explorer_body_tree(body)
-        rp = (self._repo_path or "").strip()
-
-        if not rp:
-            if tree is not None:
-                tree.remove()
-            return
-
-        try:
-            root = Path(rp).expanduser().resolve()
-        except OSError:
-            if tree is not None:
-                tree.remove()
-            return
-
-        if tree is None:
             try:
-                nt = DirectoryTree(root, id="ide-explorer-tree")
-            except OSError:
+                body = self.query_one("#ide-explorer-body", Container)
+            except Exception:
                 return
-            body.mount(nt, before=scroll)
-            return
 
-        try:
-            cur = Path(tree.path).resolve()
-        except OSError:
-            cur = None
-        if cur != root:
-            tree.path = root
+            self._explorer_one_scroll(body)
+            scroll: VerticalScroll | None = None
+            try:
+                scroll = body.query_one("#ide-explorer-scroll", VerticalScroll)
+            except Exception:
+                scroll = None
+            if scroll is None:
+                scroll = VerticalScroll(id="ide-explorer-scroll")
+                body.mount(scroll)
+
+            self._explorer_one_tree(body)
+            tree: DirectoryTree | None = None
+            try:
+                tree = body.query_one("#ide-explorer-tree", DirectoryTree)
+            except Exception:
+                tree = None
+
+            rp = (self._repo_path or "").strip()
+
+            if not rp:
+                if tree is not None:
+                    tree.remove()
+                return
+
+            try:
+                root = Path(rp).expanduser().resolve()
+            except OSError:
+                if tree is not None:
+                    tree.remove()
+                return
+
+            if tree is None:
+                try:
+                    nt = DirectoryTree(root, id="ide-explorer-tree")
+                except OSError:
+                    return
+                body.mount(nt, before=scroll)
+                return
+
+            try:
+                cur = Path(tree.path).resolve()
+            except OSError:
+                cur = None
+            if cur != root:
+                tree.path = root
+        finally:
+            self._explorer_setup_busy = False
 
     @on(DirectoryTree.FileSelected)
     def on_directory_tree_file_selected(self, event: DirectoryTree.FileSelected) -> None:
