@@ -1424,6 +1424,16 @@ class DeepCodeIdeApp(App):
 
                 self.call_next(_apply_final)
                 return
+            if t == "forced_fallback":
+                try:
+                    self._ev_debounce.flush_now()
+                except Exception:
+                    pass
+                self.ide_state.apply_event(event)
+                self.call_next(
+                    lambda: self._refresh_all_panels(reload_explorer=False)
+                )
+                return
             self._ev_debounce.push(event)
 
         import asyncio

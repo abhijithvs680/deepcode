@@ -184,7 +184,24 @@ class IDEState:
                 "title": str(event.get("title") or "")[:120],
                 "risk": str(event.get("risk") or ""),
             }
-        if t == "fast_path":
+        elif t == "forced_fallback":
+            fp = str(event.get("path") or "").replace("\\", "/").strip()
+            ph = str(event.get("phase") or "staged")
+            self.log(f"⚡ Forced fallback ({ph}): {fp}")
+            self.trace_events.append(
+                {
+                    "phase": "result",
+                    "step": 0,
+                    "group": "fallback",
+                    "tool": "system",
+                    "action": "forced_file_edit",
+                    "status": "success",
+                    "summary": f"{ph} {fp}"[:80],
+                }
+            )
+            if len(self.trace_events) > self.max_trace_lines:
+                self.trace_events = self.trace_events[-self.max_trace_lines :]
+        elif t == "fast_path":
             r = str(event.get("reason") or "trivial_query")
             q = str(event.get("query") or "")[:160]
             self.log(f"fast_path ({r}): {q}")
