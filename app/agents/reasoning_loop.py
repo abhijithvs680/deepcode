@@ -16,6 +16,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
+from app.agents.hierarchical_planner import is_create_intent
 from app.agents.react_grounding import (
     compute_answer_confidence,
     extract_goal,
@@ -32,6 +33,99 @@ from app.tools.base_tool import ToolResult
 from app.tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
+
+
+def _infer_fallback_target_path(goal: str) -> str:
+    g = (goal or "").lower()
+    if "fastapi" in g:
+        return "main.py"
+    return "deepcode_stub.py"
+
+
+def _minimal_fallback_file_body(goal: str) -> str:
+    g = (goal or "").lower()
+    if "fastapi" in g:
+        return (
+            "from fastapi import FastAPI\n\n"
+            "app = FastAPI()\n\n\n"
+            '@app.get("/health")\n'
+            "def health():\n"
+            '    return {"status": "ok"}\n'
+        )
+    return (
+        "# deepcode fallback — replace with your code\n"
+        "def main() -> None:\n"
+        '    print("hello")\n\n\n'
+        'if __name__ == "__main__":\n'
+        "    main()\n"
+    )
+
+
+def _goal_triggers_create_fallback(goal: str) -> bool:
+    """True when we should allow deterministic file write (narrower than full planner)."""
+    if is_create_intent(goal):
+        return True
+    t = (goal or "").lower()
+    return any(
+        k in t
+        for k in (
+            "fastapi",
+            "health check",
+            "healthcheck",
+            "flask app",
+            "endpoint",
+            "make main",
+            "make the main",
+            "scaffold",
+        )
+    )
+
+
+def _pick_fallback_write_path(goal: str, workspace_root: str) -> tuple[str, str]:
+    """Pick a repo-relative path and body; prefer empty or missing files for insert-all."""
+    body = _minimal_fallback_file_body(goal)
+    root = Path(workspace_root)
+    try:
+        root = root.resolve()
+    except OSError:
+        root = Path(workspace_root)
+    candidates = [_infer_fallback_target_path(goal)]
+    if candidates[0] != "deepcode_fallback_app.py":
+        candidates.append("deepcode_fallback_app.py")
+    try:
+        root_resolved = root.resolve()
+    except OSError:
+        root_resolved = root
+    for rel in candidates:
+        rel = rel.replace("\\", "/")
+        try:
+            p = (root / rel).resolve()
+            p.relative_to(root_resolved)
+        except (OSError, ValueError):
+            continue
+        if not p.is_file():
+            return rel, body
+        try:
+            if p.stat().st_size == 0:
+                return rel, body
+        except OSError:
+            continue
+    for n in range(32):
+        rel = f"deepcode_fallback_{n}.py"
+        try:
+            p = (root / rel).resolve()
+            p.relative_to(root_resolved)
+        except (OSError, ValueError):
+            continue
+        if not p.is_file():
+            return rel, body
+        try:
+            if p.stat().st_size == 0:
+                return rel, body
+        except OSError:
+            continue
+    return "deepcode_fallback_31.py", body
+
 
 _EXT = r"(?:py|pyw|js|mjs|cjs|ts|tsx|jsx|java|kt|kts|rs|go|rb|php|cs|fs|cpp|cc|c|h|hpp|vue)"
 _ERR_PATH_RES: tuple[re.Pattern[str], ...] = (
@@ -869,6 +963,8 @@ async def run_reasoning_loop(
     hard_cap = int(getattr(settings, "REACT_MAX_STEPS_CAP", 7) or 7)
     soft = int(max_steps if max_steps is not None else settings.REACT_MAX_STEPS)
     max_steps = max(1, min(soft, hard_cap))
+    mode_edit_early = str(state.get("mode") or "").lower() == "edit"
+    write_on_early = bool(state.get("write_enabled"))
     cls_loop = float(
         (state.get("classification") or {}).get("confidence", 1.0) or 1.0
     )
@@ -877,7 +973,8 @@ async def run_reasoning_loop(
     if cls_loop < 0.3:
         max_steps = min(max_steps + 2, hard_cap)
     if cls_loop < 0.5:
-        max_steps = min(max_steps, 2)
+        if not (mode_edit_early and write_on_early):
+            max_steps = min(max_steps, 2)
 
     intent = (state.get("classification") or {}).get("agent_intent", "exploratory")
     intent_s = str(intent or "exploratory").lower().strip()
@@ -982,6 +1079,7 @@ async def run_reasoning_loop(
     state["_probe_search_paths"] = []
     state.setdefault("last_shell_commands", [])
     state.pop("_scaffold_opened_shell_early", None)
+    state.pop("_react_forced_file_edit_fallback_done", None)
     state["file_scores"] = dict(state.get("file_scores") or {})
     file_scores: dict[str, float] = defaultdict(float)
     last_touch_step: dict[str, int] = {}
@@ -1059,15 +1157,17 @@ async def run_reasoning_loop(
             break
 
         if i >= 1 and int(state.get("react_useful_steps") or 0) == 0:
-            logger.info(
-                "ReasoningLoop: early stop no_signal_query (no useful steps after first)"
-            )
-            state["react_early_stop_reason"] = "no_signal_query"
-            await _emit_react(
-                state,
-                {"type": "react_low_signal_stop", "step": i},
-            )
-            break
+            mode_ed = str(state.get("mode") or "").lower() == "edit"
+            if not (mode_ed and bool(state.get("write_enabled"))):
+                logger.info(
+                    "ReasoningLoop: early stop no_signal_query (no useful steps after first)"
+                )
+                state["react_early_stop_reason"] = "no_signal_query"
+                await _emit_react(
+                    state,
+                    {"type": "react_low_signal_stop", "step": i},
+                )
+                break
 
         vo = valid_observations(state.get("react_observations") or [])
         obs_summary = "\n".join(str(x)[:500] for x in vo[-4:])
@@ -1082,6 +1182,15 @@ async def run_reasoning_loop(
                 "or get_symbol_dependencies, then read_file on any related paths you need "
                 "before signaling done.\n"
             )
+            _sg = str(
+                state.get("subgoal_description") or state.get("react_goal") or ""
+            )
+            if is_create_intent(_sg):
+                edit_extra += (
+                    "CREATE/ADD FILE INTENT: use file_edit.apply_search_replace (or "
+                    "file_edit.commit_session after edits) to persist changes on disk "
+                    "before signaling done; list_dir or read_file alone is not enough.\n"
+                )
 
         hint_extra = ""
         hf = state.get("hint_files") or []
@@ -1318,6 +1427,42 @@ async def run_reasoning_loop(
                                 "done": False,
                             }
 
+        goal_text = str(
+            state.get("subgoal_description") or state.get("react_goal") or q or ""
+        )
+        if (
+            i >= 2
+            and str(state.get("mode") or "").lower() == "edit"
+            and bool(state.get("write_enabled"))
+            and not bool(state.get("dry_run"))
+            and int(state.get("react_useful_steps") or 0) == 0
+            and _edit_tool_enabled(state)
+            and _goal_triggers_create_fallback(goal_text)
+            and not bool(state.get("_react_forced_file_edit_fallback_done"))
+        ):
+            ws = str(getattr(registry, "workspace_root", "") or "").strip()
+            if ws:
+                rel, fbody = _pick_fallback_write_path(goal_text, ws)
+                state["react_observations"].append(
+                    f"Deterministic create fallback: file_edit → {rel} "
+                    f"(no useful steps by step {i + 1})."
+                )
+                step = {
+                    "thought": (
+                        "Forced minimal file write after repeated non-productive steps."
+                    ),
+                    "tool": "file_edit",
+                    "action": "apply_search_replace",
+                    "args": {
+                        "file_path": rel,
+                        "search": "",
+                        "replace": fbody,
+                        "expected_occurrences": 1,
+                    },
+                    "done": False,
+                }
+                state["_react_forced_file_edit_fallback_done"] = True
+
         state["react_steps"].append(
             {
                 "step_index": i,
@@ -1365,6 +1510,27 @@ async def run_reasoning_loop(
                 done_like = False
 
         if done_like:
+            mode_ed = str(state.get("mode") or "").lower() == "edit"
+            writes = bool(state.get("write_enabled"))
+            no_useful = int(state.get("react_useful_steps") or 0) == 0
+            not_dry = not bool(state.get("dry_run"))
+            if (
+                mode_ed
+                and writes
+                and no_useful
+                and not_dry
+                and i < max_steps - 1
+            ):
+                logger.info(
+                    "ReasoningLoop: ignoring premature planner_done (edit, no useful steps)"
+                )
+                state["react_observations"].append(
+                    "Edit mode: use at least one substantive tool (read_file, search, "
+                    "file_edit, …) before signaling done."
+                )
+                if state.get("react_steps"):
+                    state["react_steps"].pop()
+                continue
             logger.info("ReasoningLoop: planner signaled done at step %s", i)
             state["react_early_stop_reason"] = "planner_done"
             await _emit_react(

@@ -1176,7 +1176,7 @@ class DeepCodeIdeApp(App):
             return
         repo_loaded = bool((self._repo_path or "").strip())
         mode = "edit" if repo_loaded else "ask"
-        auto_apply = False
+        auto_apply = repo_loaded
         dry_run = False
         long_run = False
 
@@ -1187,7 +1187,10 @@ class DeepCodeIdeApp(App):
             if cmd in ("/plan", "/edit", "/ask", "/build", "/run"):
                 if cmd == "/run":
                     long_run = True
-                    if "--auto-apply" in arg:
+                    if "--no-auto-apply" in arg:
+                        auto_apply = False
+                        arg = arg.replace("--no-auto-apply", "").strip()
+                    elif "--auto-apply" in arg:
                         auto_apply = True
                         arg = arg.replace("--auto-apply", "").strip()
                     if "--dry-run" in arg:
@@ -1209,9 +1212,18 @@ class DeepCodeIdeApp(App):
                 mode = cmd[1:]
                 if mode == "build":
                     mode = "edit"
+                if mode == "plan":
+                    auto_apply = False
+                elif mode == "ask":
+                    auto_apply = False
+                else:
+                    auto_apply = repo_loaded
                 if "--auto-apply" in arg:
                     auto_apply = True
                     arg = arg.replace("--auto-apply", "").strip()
+                if "--no-auto-apply" in arg:
+                    auto_apply = False
+                    arg = arg.replace("--no-auto-apply", "").strip()
                 if "--dry-run" in arg:
                     dry_run = True
                     arg = arg.replace("--dry-run", "").strip()
@@ -1233,6 +1245,7 @@ class DeepCodeIdeApp(App):
             self._mount_chat(
                 chatfmt.system_block(
                     "IDE: /help /metrics /clear /browse /repo /run /edit /plan …\n"
+                    "With a repo: default is edit + auto-apply patches; use --no-auto-apply on /edit or /run to confirm diffs manually.\n"
                     "Ctrl+P palette  |  Ctrl+B terminal panel  |  Ctrl+Shift+↑/↓ terminal height  |  "
                     "Ctrl+Shift+T shell prompt  |  Ctrl+I tab  |  Ctrl+W close tab  |  Ctrl+L clear chat  |  "
                     "Ctrl+Shift+E/D copy explorer / editor"
@@ -1435,6 +1448,7 @@ class DeepCodeIdeApp(App):
                     repo_id=self._repo_id,
                     auto_apply=auto_apply,
                     dry_run=dry_run,
+                    source="ide",
                     stream_callback=_stream_callback,
                     confirm_diff_callback=_confirm_diff_callback,
                     confirm_shell_callback=_confirm_shell_callback,
@@ -1450,6 +1464,7 @@ class DeepCodeIdeApp(App):
                     mode=mode,
                     auto_apply=auto_apply,
                     dry_run=dry_run,
+                    source="ide",
                     stream_callback=_stream_callback,
                     confirm_diff_callback=_confirm_diff_callback,
                     confirm_shell_callback=_confirm_shell_callback,

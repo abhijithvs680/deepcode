@@ -469,6 +469,7 @@ class AgentOrchestrator:
         self._repo_path = ws_root
         state = {
             "query": question,
+            "orchestrator_source": source,
             "repo_id": repo_id,
             "workspace_root": ws_root,
             "prior_react_signal_paths": [],
@@ -530,7 +531,11 @@ class AgentOrchestrator:
             )
             from app.core.event_bus import EventBus
 
-            if mode == "ask" and is_trivial_query(question, state):
+            if (
+                mode == "ask"
+                and source != "ide"
+                and is_trivial_query(question, state)
+            ):
                 prompt = (
                     "You are a helpful coding assistant. Reply briefly and naturally "
                     "(one short paragraph or less for greetings and tiny talk).\n\n"
@@ -558,7 +563,7 @@ class AgentOrchestrator:
                 or 0.35
             )
             cls_c0 = float(classification.get("confidence", 1.0) or 1.0)
-            if mode == "ask" and cls_c0 < low_sig_thr:
+            if mode == "ask" and source != "ide" and cls_c0 < low_sig_thr:
                 if (
                     looks_like_repo_exploration_query(question)
                     and str(state.get("agent_mode") or "chat") != "execute"
@@ -1290,11 +1295,14 @@ class AgentOrchestrator:
                             post_answer_conf = float(
                                 compute_answer_confidence(state)
                             )
-                            force_confirm = (
-                                post_answer_conf < 0.6
-                                or cls_c < 0.6
-                                or bool(state.get("require_user_confirm"))
-                            )
+                            if source == "ide":
+                                force_confirm = bool(state.get("require_user_confirm"))
+                            else:
+                                force_confirm = (
+                                    post_answer_conf < 0.6
+                                    or cls_c < 0.6
+                                    or bool(state.get("require_user_confirm"))
+                                )
                             state["require_user_confirm"] = bool(force_confirm)
                             state["require_edit_confirmation"] = force_confirm
 
@@ -1887,11 +1895,14 @@ class AgentOrchestrator:
                     "react_early_stop_reason": state.get("react_early_stop_reason")
                     or "",
                     "rag_decision_trace": list(state.get("rag_decision_trace") or []),
-                    "require_user_confirm": float(
-                        compute_answer_confidence(state)
-                    )
-                    < 0.6
-                    or bool(state.get("require_user_confirm")),
+                    "require_user_confirm": (
+                        False
+                        if source == "ide"
+                        else (
+                            float(compute_answer_confidence(state)) < 0.6
+                            or bool(state.get("require_user_confirm"))
+                        )
+                    ),
                     "active_working_set": list(
                         state.get("active_working_set") or []
                     ),

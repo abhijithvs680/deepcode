@@ -123,12 +123,12 @@ class Settings(BaseSettings):
 
     # ReAct-style tool-first exploration (RAG only when context is insufficient)
     REACT_AGENT_ENABLED: bool = True
-    REACT_MAX_STEPS: int = 5
+    REACT_MAX_STEPS: int = 12
     # When exploration confidence is low, ReAct may use up to this many steps
-    REACT_MAX_STEPS_CAP: int = 5
+    REACT_MAX_STEPS_CAP: int = 16
     # Hard caps by control-plane agent_mode (reasoning_loop)
-    REACT_MAX_STEPS_EXECUTE_MODE: int = 3
-    REACT_MAX_STEPS_CHAT_MODE: int = 2
+    REACT_MAX_STEPS_EXECUTE_MODE: int = 12
+    REACT_MAX_STEPS_CHAT_MODE: int = 8
     # One ReAct loop per heuristic subgoal, then merge context (single subgoal = prior behavior)
     HIERARCHICAL_REACT_ENABLED: bool = True
     # After 2+ subgoals, re-run cross-subgoal synthesis to bias remaining subgoal order

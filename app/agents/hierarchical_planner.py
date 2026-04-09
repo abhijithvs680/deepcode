@@ -175,6 +175,7 @@ _SUBSTATE_KEYS = frozenset(
         "learned_file_bias",
         "prior_react_signal_paths",
         "agent_mode",
+        "orchestrator_source",
     }
 )
 

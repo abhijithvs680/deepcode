@@ -23,6 +23,7 @@ async def run_ask_async(
     mode: str = "ask",
     auto_apply: bool = False,
     dry_run: bool = False,
+    source: str = "cli",
     **kwargs: Any,
 ) -> dict[str, Any]:
     try:
@@ -39,7 +40,7 @@ async def run_ask_async(
                 question=question,
                 context=context,
                 debug=debug,
-                source="cli",
+                source=source,
                 repo_id=repo_id,
                 mode=mode,
                 auto_apply=auto_apply,
@@ -59,7 +60,7 @@ async def run_ask_async(
             question=question,
             context=context,
             debug=debug,
-            source="cli",
+            source=source,
             repo_id=repo_id,
             mode=mode,
             auto_apply=auto_apply,
@@ -76,6 +77,7 @@ async def run_long_goal_async(
     repo_id: str | None = None,
     auto_apply: bool = False,
     dry_run: bool = False,
+    source: str = "cli",
     **kwargs: Any,
 ) -> dict[str, Any]:
     """Macro loop over decomposed tasks (edit mode); see app.agents.long_run_agent."""
@@ -97,7 +99,7 @@ async def run_long_goal_async(
                 repo_id=repo_id,
                 extra_context=context,
                 debug=debug,
-                source="cli",
+                source=source,
                 auto_apply=auto_apply,
                 dry_run=dry_run,
                 **kwargs,
@@ -119,7 +121,7 @@ async def run_long_goal_async(
             repo_id=repo_id,
             extra_context=context,
             debug=debug,
-            source="cli",
+            source=source,
             auto_apply=auto_apply,
             dry_run=dry_run,
             **kwargs,
