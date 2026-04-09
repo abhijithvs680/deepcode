@@ -826,7 +826,51 @@ def has_dependency_coverage(
     return False
 
 
-def subgoal_success(sub_state: dict[str, Any]) -> bool:
+def is_create_intent(description: str) -> bool:
+    """Heuristic: subgoal text implies creating/adding a new file on disk."""
+    t = (description or "").lower()
+    return any(
+        k in t
+        for k in (
+            "create",
+            "new file",
+            "new python",
+            "add file",
+            "add a new",
+        )
+    )
+
+
+def subgoal_had_successful_file_edit_write(sub_state: dict[str, Any]) -> bool:
+    """True if any successful file_edit apply/commit touched disk."""
+    for tr in sub_state.get("tool_results") or []:
+        if not isinstance(tr, dict) or not tr.get("success"):
+            continue
+        t = str(tr.get("tool") or "").lower()
+        a = str(tr.get("action") or "").lower()
+        if t == "file_edit" and a in ("apply_search_replace", "commit_session"):
+            return True
+    return False
+
+
+def count_disk_writes_from_tool_results(sub_state: dict[str, Any]) -> int:
+    """Count successful file_edit steps that imply a disk touch (for telemetry)."""
+    n = 0
+    for tr in sub_state.get("tool_results") or []:
+        if not isinstance(tr, dict) or not tr.get("success"):
+            continue
+        t = str(tr.get("tool") or "").lower()
+        a = str(tr.get("action") or "").lower()
+        if t == "file_edit" and a in ("apply_search_replace", "commit_session"):
+            n += 1
+    return n
+
+
+def subgoal_success(
+    sub_state: dict[str, Any], *, subgoal_description: str | None = None
+) -> bool:
+    if subgoal_description and is_create_intent(subgoal_description):
+        return subgoal_had_successful_file_edit_write(sub_state)
     if sub_state.get("files_read") or sub_state.get("symbols_found"):
         return True
     if int(sub_state.get("react_useful_steps") or 0) >= 1:

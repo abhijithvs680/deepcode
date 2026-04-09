@@ -681,6 +681,7 @@ class AgentOrchestrator:
                             from app.agents.hierarchical_planner import (
                                 Subgoal,
                                 build_active_working_set,
+                                count_disk_writes_from_tool_results,
                                 create_substate,
                                 decompose_goal,
                                 estimate_dynamic_score,
@@ -763,7 +764,14 @@ class AgentOrchestrator:
                                     await finalize_react_edit_session(
                                         reg,
                                         state,
-                                        commit=subgoal_success(state),
+                                        commit=subgoal_success(
+                                            state,
+                                            subgoal_description=str(
+                                                state.get("subgoal_description")
+                                                or state.get("current_step")
+                                                or ""
+                                            ),
+                                        ),
                                     )
                                     state.pop("react_low_signal_repo_probe", None)
                                     state.pop("react_probe_max_steps", None)
@@ -834,7 +842,10 @@ class AgentOrchestrator:
                                         await finalize_react_edit_session(
                                             reg,
                                             sub,
-                                            commit=subgoal_success(sub),
+                                            commit=subgoal_success(
+                                                sub,
+                                                subgoal_description=sg.description,
+                                            ),
                                         )
                                     subgoal_runs.append((sg, sub))
                                     state["prior_react_signal_paths"] = list(
@@ -938,12 +949,27 @@ class AgentOrchestrator:
                                         )[:5],
                                     }
                                     sconf = compute_answer_confidence(sub)
-                                    if subgoal_success(sub):
+                                    sg_ok = subgoal_success(
+                                        sub, subgoal_description=sg.description
+                                    )
+                                    if sg_ok:
                                         completed_ids.append(sg.id)
+                                    esr_sub = str(
+                                        sub.get("react_early_stop_reason") or ""
+                                    ).strip()
                                     await EventBus.emit(
                                         {
                                             "type": "subgoal_complete",
                                             "subgoal_id": sg.id,
+                                            "description": (sg.description or "")[:200],
+                                            "success": sg_ok,
+                                            "early_stop_reason": esr_sub,
+                                            "files_touched": count_disk_writes_from_tool_results(
+                                                sub
+                                            ),
+                                            "tools_used": len(
+                                                sub.get("tool_results") or []
+                                            ),
                                             "confidence": sconf,
                                             "files_found": len(
                                                 sub.get("files_read") or []

@@ -542,6 +542,16 @@ class DeepCodeIdeApp(App):
                 self._explorer_setup_pending = False
                 self.call_next(self._setup_explorer_workspace_tree)
 
+    def _refresh_explorer_tree(self) -> None:
+        """Reload workspace DirectoryTree after agent writes (see `file_updated` events)."""
+        if not (self._repo_path or "").strip():
+            return
+        try:
+            tree = self.query_one("#ide-explorer-tree", DirectoryTree)
+            tree.reload()
+        except Exception:
+            pass
+
     @on(DirectoryTree.FileSelected)
     def on_directory_tree_file_selected(self, event: DirectoryTree.FileSelected) -> None:
         if getattr(event.control, "id", None) != "ide-explorer-tree":
@@ -686,14 +696,23 @@ class DeepCodeIdeApp(App):
                 if fp == active_rel:
                     self._editor_reload_after_agent_write_if_not_dirty()
                     break
-        self.call_next(self._refresh_all_panels)
+        reload_explorer = bool((self._repo_path or "").strip()) and any(
+            e.get("type") == "file_updated" for e in batch
+        )
+        self.call_next(
+            lambda r=reload_explorer: self._refresh_all_panels(
+                reload_explorer=r
+            )
+        )
 
     def _chat_scroll(self) -> VerticalScroll:
         return self.query_one("#ide-chat-scroll", VerticalScroll)
 
-    def _refresh_all_panels(self) -> None:
+    def _refresh_all_panels(self, *, reload_explorer: bool = False) -> None:
         def _apply() -> None:
             try:
+                if reload_explorer:
+                    self._refresh_explorer_tree()
                 ex = self.query_one("#ide-explorer-scroll", VerticalScroll)
                 ex.remove_children()
                 ex.mount(

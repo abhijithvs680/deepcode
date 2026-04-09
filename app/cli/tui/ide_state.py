@@ -256,11 +256,23 @@ class IDEState:
             self.subgoal_timeline = self.subgoal_timeline[-24:]
         elif t == "subgoal_complete":
             sid = event.get("subgoal_id")
+            success = event.get("success")
+            esr = str(event.get("early_stop_reason") or "").strip()
             for row in reversed(self.subgoal_timeline):
                 if row.get("id") == sid and row.get("status") == "running":
-                    row["status"] = "done"
+                    if success is True:
+                        row["status"] = "done"
+                    elif success is False:
+                        row["status"] = (
+                            "warning" if esr == "planner_done" else "failed"
+                        )
+                    else:
+                        row["status"] = "done"
                     row["confidence"] = event.get("confidence")
                     row["files_found"] = event.get("files_found")
+                    row["early_stop_reason"] = esr
+                    row["files_touched"] = event.get("files_touched")
+                    row["tools_used"] = event.get("tools_used")
                     break
         elif t == "state":
             gp = float(event.get("goal_progress") or 0)
@@ -605,10 +617,23 @@ class IDEState:
         lines = []
         for i, row in enumerate(self.subgoal_timeline[-14:], 1):
             st = row.get("status") or "?"
-            sym = "✔" if st == "done" else ("⚠" if st == "running" else "○")
+            if st == "done":
+                sym = "✔"
+            elif st == "warning":
+                sym = "⚠"
+            elif st == "failed":
+                sym = "✖"
+            elif st == "running":
+                sym = "○"
+            else:
+                sym = "○"
             sid = row.get("id") or "?"
             desc = (row.get("description") or "")[:56]
-            lines.append(f"[{i}] {sym} [{sid}] {desc}")
+            esr = str(row.get("early_stop_reason") or "").strip()
+            suf = ""
+            if esr and st in ("warning", "failed"):
+                suf = f" [dim]({rich_escape(esr[:44])})[/dim]"
+            lines.append(f"[{i}] {sym} [{sid}] {desc}{suf}")
         return "\n".join(lines)
 
     def trace_panel_text(self) -> str:
