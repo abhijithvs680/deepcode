@@ -2,8 +2,8 @@
 Mutable IDE runtime state for DeepCode V2 (agent IDE). Updated from EventBus + orchestrator meta.
 
 Event types: agent_file_open, diff_ready, file_updated, agent_status, final_answer,
-  shell_command_proposed, subgoal_start, subgoal_complete, state, rag_*, cycle_*,
-  task_*, goal_complete
+  shell_command_proposed, subgoal_start, subgoal_complete, subgoal_failed,
+  session_invalid, tool_blocked, state, rag_*, cycle_*, task_*, goal_complete
 """
 from __future__ import annotations
 
@@ -304,9 +304,13 @@ class IDEState:
                 }
             )
             self.subgoal_timeline = self.subgoal_timeline[-24:]
-        elif t == "subgoal_complete":
+        elif t in ("subgoal_complete", "subgoal_failed"):
             sid = event.get("subgoal_id")
-            success = event.get("success")
+            success = (
+                event.get("success")
+                if t == "subgoal_complete"
+                else False
+            )
             esr = str(event.get("early_stop_reason") or "").strip()
             for row in reversed(self.subgoal_timeline):
                 if row.get("id") == sid and row.get("status") == "running":
@@ -323,7 +327,28 @@ class IDEState:
                     row["early_stop_reason"] = esr
                     row["files_touched"] = event.get("files_touched")
                     row["tools_used"] = event.get("tools_used")
+                    row["disk_verified"] = event.get("disk_verified")
+                    row["disk_claimed"] = event.get("disk_claimed")
                     break
+            if t == "subgoal_failed":
+                reason = str(event.get("failure_reason") or "verification_failed")
+                self.log(f"✗ Subgoal failed ({sid}): {reason[:120]}")
+        elif t == "session_invalid":
+            r = str(event.get("reason") or "desync")
+            self.log(f"⚠ Session invalid: {r}")
+            self.trace_events.append(
+                {
+                    "phase": "result",
+                    "step": 0,
+                    "group": "integrity",
+                    "tool": "system",
+                    "action": "session_invalid",
+                    "status": "fail",
+                    "summary": r[:80],
+                }
+            )
+            if len(self.trace_events) > self.max_trace_lines:
+                self.trace_events = self.trace_events[-self.max_trace_lines :]
         elif t == "state":
             gp = float(event.get("goal_progress") or 0)
             self.confidence = max(self.confidence, gp)

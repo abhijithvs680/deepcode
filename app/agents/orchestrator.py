@@ -8,6 +8,7 @@ import asyncio
 import os
 import time
 import uuid
+from pathlib import Path
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,6 +23,75 @@ from app.providers.factory import get_provider
 
 logger = get_logger(__name__)
 settings = get_settings()
+
+
+def _norm_rel_write_path(p: str) -> str:
+    return str(p).replace("\\", "/").strip().lstrip("./")
+
+
+def claimed_write_rel_paths_from_substate(sub: dict) -> list[str]:
+    """Repo-relative paths the subgoal claims to have written (from tool results)."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for tr in sub.get("tool_results") or []:
+        if not isinstance(tr, dict) or not tr.get("success"):
+            continue
+        t = str(tr.get("tool") or "").lower()
+        a = str(tr.get("action") or "").lower()
+        if t != "file_edit":
+            continue
+        if a not in (
+            "apply_search_replace",
+            "commit_session",
+            "direct_write_fallback",
+        ):
+            continue
+        data = tr.get("data")
+        if not isinstance(data, dict):
+            continue
+        for fw in data.get("files_written") or []:
+            n = _norm_rel_write_path(str(fw))
+            if n and n not in seen and ".." not in n.split("/"):
+                seen.add(n)
+                out.append(n)
+        f0 = data.get("file")
+        if f0:
+            n = _norm_rel_write_path(str(f0))
+            if n and n not in seen and ".." not in n.split("/"):
+                seen.add(n)
+                out.append(n)
+    for raw in sub.get("react_edited_paths") or []:
+        n = _norm_rel_write_path(str(raw))
+        if n and n not in seen and ".." not in n.split("/"):
+            seen.add(n)
+            out.append(n)
+    return out
+
+
+def verify_claimed_write_paths_exist(
+    workspace_root: str, rel_paths: list[str]
+) -> tuple[int, list[str]]:
+    """Return (number of paths that exist as files, missing rel paths)."""
+    if not (workspace_root or "").strip() or not rel_paths:
+        return 0, list(rel_paths)
+    try:
+        root = Path(workspace_root).resolve()
+    except OSError:
+        return 0, list(rel_paths)
+    missing: list[str] = []
+    ok = 0
+    for rel in rel_paths:
+        try:
+            p = (root / rel).resolve()
+            p.relative_to(root)
+        except (OSError, ValueError):
+            missing.append(rel)
+            continue
+        if p.is_file():
+            ok += 1
+        else:
+            missing.append(rel)
+    return ok, missing
 
 
 def _workspace_root_for_repo(repo_id: str | None) -> str:
@@ -518,6 +588,10 @@ class AgentOrchestrator:
             if _cb_key in kwargs:
                 state[_cb_key] = kwargs[_cb_key]
 
+        for _rk in list(kwargs.keys()):
+            if str(_rk).startswith("_react_"):
+                kwargs.pop(_rk, None)
+
         try:
             status_cb = kwargs.get("status_callback") if "kwargs" in locals() else state.get("status_callback")
 
@@ -696,6 +770,7 @@ class AgentOrchestrator:
                                 merged_symbols_so_far,
                                 partial_subgoal_traces_for_synthesis,
                                 should_stop_subgoal_loop,
+                                is_create_intent,
                                 subgoal_success,
                                 subgoal_synthesis_bias_score,
                             )
@@ -957,36 +1032,101 @@ class AgentOrchestrator:
                                     sg_ok = subgoal_success(
                                         sub, subgoal_description=sg.description
                                     )
-                                    if sg_ok:
+                                    ws_verify = (
+                                        str(
+                                            getattr(reg, "workspace_root", "")
+                                            or state.get("workspace_root")
+                                            or ""
+                                        ).strip()
+                                    )
+                                    claimed_paths = claimed_write_rel_paths_from_substate(
+                                        sub
+                                    )
+                                    v_ok, v_missing = verify_claimed_write_paths_exist(
+                                        ws_verify, claimed_paths
+                                    )
+                                    sub["disk_writes_claimed"] = len(claimed_paths)
+                                    sub["disk_writes_verified"] = v_ok
+                                    sub["disk_writes_missing"] = v_missing[:24]
+                                    final_success = bool(sg_ok)
+                                    if claimed_paths and v_ok < len(claimed_paths):
+                                        final_success = False
+                                        logger.warning(
+                                            "Subgoal %s: planner success but %s claimed path(s) "
+                                            "missing on disk (verified=%s/%s)",
+                                            sg.id,
+                                            len(v_missing),
+                                            v_ok,
+                                            len(claimed_paths),
+                                        )
+                                        await EventBus.emit(
+                                            {
+                                                "type": "session_invalid",
+                                                "reason": "planner_executor_desync",
+                                                "subgoal_id": sg.id,
+                                                "missing_paths": v_missing[:16],
+                                                "claimed_paths": claimed_paths[:16],
+                                            }
+                                        )
+                                    elif (
+                                        is_create_intent(sg.description)
+                                        and final_success
+                                        and v_ok == 0
+                                    ):
+                                        final_success = False
+                                        await EventBus.emit(
+                                            {
+                                                "type": "session_invalid",
+                                                "reason": "create_intent_no_file_on_disk",
+                                                "subgoal_id": sg.id,
+                                            }
+                                        )
+                                    if final_success:
                                         completed_ids.append(sg.id)
                                     esr_sub = str(
                                         sub.get("react_early_stop_reason") or ""
                                     ).strip()
-                                    await EventBus.emit(
-                                        {
-                                            "type": "subgoal_complete",
-                                            "subgoal_id": sg.id,
-                                            "description": (sg.description or "")[:200],
-                                            "success": sg_ok,
-                                            "early_stop_reason": esr_sub,
-                                            "files_touched": count_disk_writes_from_tool_results(
-                                                sub
-                                            ),
-                                            "tools_used": len(
-                                                sub.get("tool_results") or []
-                                            ),
-                                            "confidence": sconf,
-                                            "files_found": len(
-                                                sub.get("files_read") or []
-                                            ),
-                                            "symbols_found": len(
-                                                sub.get("symbols_found") or []
-                                            ),
-                                            "useful_steps": int(
-                                                sub.get("react_useful_steps") or 0
-                                            ),
-                                        }
+                                    touched = count_disk_writes_from_tool_results(sub)
+                                    sub_ev: dict = {
+                                        "subgoal_id": sg.id,
+                                        "description": (sg.description or "")[:200],
+                                        "success": final_success,
+                                        "early_stop_reason": esr_sub,
+                                        "planner_success": sg_ok,
+                                        "files_touched": touched,
+                                        "disk_verified": v_ok,
+                                        "disk_claimed": len(claimed_paths),
+                                        "tools_used": len(sub.get("tool_results") or []),
+                                        "confidence": sconf,
+                                        "files_found": len(sub.get("files_read") or []),
+                                        "symbols_found": len(
+                                            sub.get("symbols_found") or []
+                                        ),
+                                        "useful_steps": int(
+                                            sub.get("react_useful_steps") or 0
+                                        ),
+                                    }
+                                    if v_missing:
+                                        sub_ev["disk_missing"] = v_missing[:12]
+                                    sub_ev["type"] = (
+                                        "subgoal_complete"
+                                        if final_success
+                                        else "subgoal_failed"
                                     )
+                                    if not final_success:
+                                        if claimed_paths and v_ok < len(claimed_paths):
+                                            sub_ev["failure_reason"] = (
+                                                "disk_verification_failed"
+                                            )
+                                        elif is_create_intent(sg.description):
+                                            sub_ev["failure_reason"] = (
+                                                "create_intent_no_file_on_disk"
+                                            )
+                                        else:
+                                            sub_ev["failure_reason"] = (
+                                                "subgoal_success_criteria_not_met"
+                                            )
+                                    await EventBus.emit(sub_ev)
                                     if should_stop_subgoal_loop(
                                         plan_size=len(plan.subgoals),
                                         completed_ids=completed_ids,

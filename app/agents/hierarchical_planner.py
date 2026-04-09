@@ -229,6 +229,8 @@ def create_substate(parent_state: dict[str, Any], subgoal: Subgoal) -> dict[str,
     s["subgoal_description"] = subgoal.description
     s["current_step"] = subgoal.description
     s["react_goal"] = subgoal.description
+    s.pop("_react_fallback_used", None)
+    s.pop("execution_scope", None)
 
     # Neutralize router hint so subgoals are not locked to parent's tool choice.
     s["selected_tool"] = None
