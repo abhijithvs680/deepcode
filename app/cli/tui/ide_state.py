@@ -201,6 +201,22 @@ class IDEState:
             )
             if len(self.trace_events) > self.max_trace_lines:
                 self.trace_events = self.trace_events[-self.max_trace_lines :]
+        elif t == "tool_blocked":
+            reason = str(event.get("reason") or "blocked")
+            self.log(f"⛔ Tool blocked: {reason}")
+            self.trace_events.append(
+                {
+                    "phase": "result",
+                    "step": int(event.get("step") or 0),
+                    "group": "guard",
+                    "tool": str(event.get("tool") or "unknown"),
+                    "action": "blocked",
+                    "status": "fail",
+                    "summary": reason[:80],
+                }
+            )
+            if len(self.trace_events) > self.max_trace_lines:
+                self.trace_events = self.trace_events[-self.max_trace_lines :]
         elif t == "fallback_execution_failed":
             fp = str(event.get("path") or "").replace("\\", "/").strip()
             err = str(event.get("error") or "")[:200]

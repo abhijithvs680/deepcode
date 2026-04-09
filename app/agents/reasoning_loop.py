@@ -91,6 +91,12 @@ def _pick_fallback_write_path(goal: str, workspace_root: str) -> tuple[str, str]
     return "main.py", body
 
 
+def _file_edit_replace_uses_subprocess_pip_install(replace: str) -> bool:
+    """Block Python files that shell out to pip instead of using shell.run_command."""
+    r = (replace or "").lower()
+    return "subprocess" in r and "pip install" in r
+
+
 def _direct_write_fallback_file(
     workspace_root: str, rel: str, content: str
 ) -> tuple[bool, str]:
@@ -1199,6 +1205,18 @@ async def run_reasoning_loop(
     router = state.get("selected_tool")
     rconf = float(state.get("router_confidence") or 0.0)
     state["react_goal"] = extract_goal(q)
+    scope_goal = str(
+        state.get("subgoal_description") or state.get("react_goal") or q or ""
+    )
+    if (
+        is_create_intent(scope_goal)
+        and mode_edit
+        and write_on
+        and not bool(state.get("dry_run"))
+    ):
+        state["execution_scope"] = "code_only"
+    else:
+        state.pop("execution_scope", None)
     state["goal_progress"] = 0.0
     _ACTION_SOFT_LIMITS: dict[str, int] = {
         "search": 3,
@@ -1314,6 +1332,8 @@ async def run_reasoning_loop(
     if state.get("subgoal_id"):
         sess_ev["subgoal_id"] = state["subgoal_id"]
         sess_ev["subgoal_description"] = (state.get("subgoal_description") or "")[:200]
+    if state.get("execution_scope"):
+        sess_ev["execution_scope"] = state["execution_scope"]
     await _emit_react(state, sess_ev)
 
     state["react_early_stop_reason"] = ""
@@ -1532,6 +1552,7 @@ async def run_reasoning_loop(
             and max_steps >= 1
             and not bool(state.get("react_low_signal_repo_probe"))
             and not skip_llm_for_create
+            and state.get("execution_scope") != "code_only"
         ):
             premature = (
                 not step.get("tool")
@@ -1771,6 +1792,16 @@ async def run_reasoning_loop(
                             ),
                         },
                     )
+                    if state.get("execution_scope") == "code_only":
+                        logger.info(
+                            "ReasoningLoop: code_only — direct write complete; stopping"
+                        )
+                        state["react_early_stop_reason"] = "write_complete"
+                        await _emit_react(
+                            state,
+                            {"type": "react_write_complete_stop", "step": i},
+                        )
+                        break
                     continue
 
                 rel_norm = _norm_rel_path(rel)
@@ -1829,7 +1860,13 @@ async def run_reasoning_loop(
             or str(step.get("action") or "").strip().lower() == "done"
             or not step.get("tool")
         )
-        if done_like and am == "execute" and _scaf and shell_ok:
+        if (
+            done_like
+            and am == "execute"
+            and _scaf
+            and shell_ok
+            and state.get("execution_scope") != "code_only"
+        ):
             cmd_gate = infer_scaffold_shell_command(str(q))
             shell_ran = any(
                 isinstance(x, dict) and str(x.get("tool") or "").lower() == "shell"
@@ -1893,6 +1930,49 @@ async def run_reasoning_loop(
         action = str(step.get("action") or "").strip()
         args = step.get("args") if isinstance(step.get("args"), dict) else {}
 
+        if (
+            tool_name == "file_edit"
+            and action == "apply_search_replace"
+            and not args.get("dry_run")
+            and _file_edit_replace_uses_subprocess_pip_install(
+                str(args.get("replace") or "")
+            )
+        ):
+            fp_hint = str(args.get("file_path") or args.get("path") or "")[:120]
+            logger.warning(
+                "ReasoningLoop: blocked file_edit subprocess+pip install workaround path=%r",
+                fp_hint,
+            )
+            state["react_observations"].append(
+                "Blocked file_edit: subprocess pip installs are not allowed — "
+                "use shell.run_command for installs, or add dependencies to requirements."
+            )
+            state["react_failed_steps"] += 1
+            await EventBus.emit(
+                {
+                    "type": "tool_blocked",
+                    "reason": "subprocess_install_not_allowed",
+                    "tool": "file_edit",
+                    "path": fp_hint,
+                    "subgoal_id": state.get("subgoal_id"),
+                }
+            )
+            await _emit_step_evt(
+                state,
+                phase="result",
+                step=i,
+                tool=tool_name,
+                action=action,
+                status="fail",
+                summary="blocked subprocess pip",
+                duration_ms=0,
+            )
+            if state["react_failed_steps"] >= 2:
+                await _maybe_force_rag_escape_emit(state)
+                state["react_early_stop_reason"] = "failed_steps_limit"
+                break
+            continue
+
         await _emit_step_evt(
             state,
             phase="start",
@@ -1908,10 +1988,18 @@ async def run_reasoning_loop(
             valid_tools = ("file", "file_edit", "git", "log")
         if shell_ok:
             valid_tools = valid_tools + ("shell",)
+        if state.get("execution_scope") == "code_only":
+            valid_tools = ("file_edit",)
         if tool_name not in valid_tools:
-            state["react_observations"].append(
-                f"Step {i}: invalid tool {tool_name!r} — stopping."
-            )
+            if state.get("execution_scope") == "code_only":
+                state["react_observations"].append(
+                    f"Step {i}: tool {tool_name!r} blocked — create-intent code_only "
+                    "allows file_edit only (no shell / list_dir / pip via other tools)."
+                )
+            else:
+                state["react_observations"].append(
+                    f"Step {i}: invalid tool {tool_name!r} — stopping."
+                )
             state["react_failed_steps"] += 1
             await _emit_step_evt(
                 state,
@@ -2379,6 +2467,24 @@ async def run_reasoning_loop(
                 ),
             }
         )
+
+        if (
+            state.get("execution_scope") == "code_only"
+            and res
+            and res.success
+            and tool_name == "file_edit"
+            and action == "apply_search_replace"
+            and not args.get("dry_run")
+        ):
+            logger.info(
+                "ReasoningLoop: code_only — file_edit write succeeded; stopping"
+            )
+            state["react_early_stop_reason"] = "write_complete"
+            await _emit_react(
+                state,
+                {"type": "react_write_complete_stop", "step": i},
+            )
+            break
 
         if (
             res
