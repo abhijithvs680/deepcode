@@ -54,32 +54,89 @@ def _minimal_fallback_file_body(goal: str) -> str:
     )
 
 
-def _goal_triggers_create_fallback(goal: str) -> bool:
-    """True when we should allow deterministic create fallback (API / app / scaffold phrasing)."""
-    if is_create_intent(goal):
+def _react_or_node_scaffold_intent(goal: str) -> bool:
+    """True when the task is clearly JS/frontend/Node — never use Python main.py fallback."""
+    g = (goal or "").lower()
+    if any(
+        tok in g
+        for tok in (
+            "react",
+            "next.js",
+            "nextjs",
+            "vite",
+            "vue",
+            "angular",
+            "svelte",
+            "frontend",
+            "create-react-app",
+            "create react app",
+            "webpack",
+            "tailwind",
+            "javascript app",
+            "typescript app",
+            "spa ",
+        )
+    ):
         return True
+    if re.search(r"\b(npm|npx|yarn|pnpm|node)\b", g):
+        return True
+    return False
+
+
+def _goal_triggers_create_fallback(goal: str) -> bool:
+    """
+    True only for Python/backend create rescue (main.py / stub) — not React/npm/Vite.
+    """
+    if _react_or_node_scaffold_intent(goal):
+        return False
     g = (goal or "").lower()
     if any(
         k in g
         for k in (
             "fastapi",
+            "flask",
+            "django",
+            "starlette",
+            "uvicorn",
             "health check",
             "healthcheck",
-            "flask app",
-            "endpoint",
-            "make main",
-            "make the main",
-            "scaffold",
-            "uvicorn",
-            "django",
+            "openapi",
         )
     ):
         return True
-    if "create" in g:
+    if any(
+        k in g
+        for k in (
+            "rest api",
+            "restful api",
+            "endpoint",
+            "api route",
+            "graphql",
+        )
+    ):
         return True
-    if re.search(r"\bapi\b", g):
+    if ".py" in g or "python file" in g or "python app" in g or "python api" in g:
         return True
-    if re.search(r"\bapp\b", g):
+    if is_create_intent(goal):
+        if any(
+            k in g
+            for k in (
+                "python",
+                "pip ",
+                "pip install",
+                "virtualenv",
+                "venv",
+                "pytest",
+                "backend",
+            )
+        ):
+            return True
+        return False
+    if "make main" in g or "make the main" in g:
+        return True
+    if "scaffold" in g and any(
+        x in g for x in ("python", "fastapi", "flask", "django", "pip", "uvicorn")
+    ):
         return True
     return False
 
@@ -1208,8 +1265,11 @@ async def run_reasoning_loop(
     scope_goal = str(
         state.get("subgoal_description") or state.get("react_goal") or q or ""
     )
+    if _react_or_node_scaffold_intent(scope_goal) and mode_edit:
+        shell_ok = True
     if (
         is_create_intent(scope_goal)
+        and _goal_triggers_create_fallback(scope_goal)
         and mode_edit
         and write_on
         and not bool(state.get("dry_run"))
@@ -1383,6 +1443,12 @@ async def run_reasoning_loop(
                     "CREATE/ADD FILE INTENT: use file_edit.apply_search_replace (or "
                     "file_edit.commit_session after edits) to persist changes on disk "
                     "before signaling done; list_dir or read_file alone is not enough.\n"
+                )
+            if _react_or_node_scaffold_intent(_sg):
+                edit_extra += (
+                    "FRONTEND / NODE TASK: use shell.run_command for npm/npx/vite/CRA/next "
+                    "scaffolds — do not substitute a Python main.py or pip-in-subprocess "
+                    "hacks unless the user explicitly asked for Python.\n"
                 )
 
         hint_extra = ""
