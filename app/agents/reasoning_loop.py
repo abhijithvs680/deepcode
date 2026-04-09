@@ -35,13 +35,6 @@ from app.tools.registry import ToolRegistry
 logger = logging.getLogger(__name__)
 
 
-def _infer_fallback_target_path(goal: str) -> str:
-    g = (goal or "").lower()
-    if "fastapi" in g:
-        return "main.py"
-    return "deepcode_stub.py"
-
-
 def _minimal_fallback_file_body(goal: str) -> str:
     g = (goal or "").lower()
     if "fastapi" in g:
@@ -62,12 +55,12 @@ def _minimal_fallback_file_body(goal: str) -> str:
 
 
 def _goal_triggers_create_fallback(goal: str) -> bool:
-    """True when we should allow deterministic file write (narrower than full planner)."""
+    """True when we should allow deterministic create fallback (API / app / scaffold phrasing)."""
     if is_create_intent(goal):
         return True
-    t = (goal or "").lower()
-    return any(
-        k in t
+    g = (goal or "").lower()
+    if any(
+        k in g
         for k in (
             "fastapi",
             "health check",
@@ -77,54 +70,25 @@ def _goal_triggers_create_fallback(goal: str) -> bool:
             "make main",
             "make the main",
             "scaffold",
+            "uvicorn",
+            "django",
         )
-    )
+    ):
+        return True
+    if "create" in g:
+        return True
+    if re.search(r"\bapi\b", g):
+        return True
+    if re.search(r"\bapp\b", g):
+        return True
+    return False
 
 
 def _pick_fallback_write_path(goal: str, workspace_root: str) -> tuple[str, str]:
-    """Pick a repo-relative path and body; prefer empty or missing files for insert-all."""
+    """Deterministic entry file for create fallback (avoids deepcode_fallback_*.py drift)."""
+    _ = workspace_root  # reserved for future repo-type routing
     body = _minimal_fallback_file_body(goal)
-    root = Path(workspace_root)
-    try:
-        root = root.resolve()
-    except OSError:
-        root = Path(workspace_root)
-    candidates = [_infer_fallback_target_path(goal)]
-    if candidates[0] != "deepcode_fallback_app.py":
-        candidates.append("deepcode_fallback_app.py")
-    try:
-        root_resolved = root.resolve()
-    except OSError:
-        root_resolved = root
-    for rel in candidates:
-        rel = rel.replace("\\", "/")
-        try:
-            p = (root / rel).resolve()
-            p.relative_to(root_resolved)
-        except (OSError, ValueError):
-            continue
-        if not p.is_file():
-            return rel, body
-        try:
-            if p.stat().st_size == 0:
-                return rel, body
-        except OSError:
-            continue
-    for n in range(32):
-        rel = f"deepcode_fallback_{n}.py"
-        try:
-            p = (root / rel).resolve()
-            p.relative_to(root_resolved)
-        except (OSError, ValueError):
-            continue
-        if not p.is_file():
-            return rel, body
-        try:
-            if p.stat().st_size == 0:
-                return rel, body
-        except OSError:
-            continue
-    return "deepcode_fallback_31.py", body
+    return "main.py", body
 
 
 def _direct_write_fallback_file(
@@ -148,11 +112,22 @@ def _direct_write_fallback_file(
         dest.relative_to(root)
     except (OSError, ValueError) as e:
         return False, str(e)
+    logger.info(
+        "[WRITE] direct_fallback abs=%s exists_before=%s",
+        dest,
+        dest.is_file(),
+    )
     try:
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(content, encoding="utf-8")
     except OSError as e:
+        logger.warning("[WRITE] direct_fallback failed abs=%s err=%s", dest, e)
         return False, str(e)
+    try:
+        sz = dest.stat().st_size
+    except OSError:
+        sz = -1
+    logger.info("[WRITE DONE] direct_fallback abs=%s size=%s", dest, sz)
     return True, ""
 
 
@@ -1045,6 +1020,106 @@ async def _emit_step_evt(
     await _emit_react(state, ev)
 
 
+async def _finalize_create_main_invariant(
+    state: dict[str, Any],
+    registry: ToolRegistry,
+    query_hint: str,
+    step_index: int,
+) -> None:
+    """
+    If edit + create-intent finished without main.py on disk, write it once.
+    Catches planner/tool paths that never triggered the in-loop fallback.
+    """
+    goal_final = str(
+        state.get("subgoal_description") or state.get("react_goal") or query_hint or ""
+    )
+    ws_final = str(getattr(registry, "workspace_root", "") or "").strip()
+    if not ws_final:
+        return
+    if str(state.get("mode") or "").lower() != "edit":
+        return
+    if not bool(state.get("write_enabled")):
+        return
+    if bool(state.get("dry_run")):
+        return
+    if not is_create_intent(goal_final):
+        return
+    if not _goal_triggers_create_fallback(goal_final):
+        return
+    try:
+        root = Path(ws_final).resolve()
+        main_abs = (root / "main.py").resolve()
+        main_abs.relative_to(root)
+    except (OSError, ValueError):
+        return
+    if main_abs.is_file():
+        return
+    body = _minimal_fallback_file_body(goal_final)
+    ok, err = _direct_write_fallback_file(ws_final, "main.py", body)
+    logger.warning(
+        "ReasoningLoop: end-of-session create invariant wrote main.py ok=%s err=%r",
+        ok,
+        err,
+    )
+    if not ok:
+        return
+    state["_react_fallback_allowed_edit_paths"] = ["main.py"]
+    state["_react_forced_file_edit_fallback_done"] = True
+    state["react_useful_steps"] = int(state.get("react_useful_steps") or 0) + 1
+    rel_norm = "main.py"
+    if rel_norm not in state["files_read"]:
+        state["files_read"].append(rel_norm)
+    state["react_observations"].append(
+        "⚡ End invariant: wrote main.py (create-intent; was missing on disk)."
+    )
+    tr = ToolResult(
+        tool="file_edit",
+        action="direct_write_fallback",
+        success=True,
+        data={
+            "file": rel_norm,
+            "files_written": [rel_norm],
+            "direct": True,
+            "invariant": True,
+        },
+    )
+    state["tool_results"].append(tr.model_dump())
+    await EventBus.emit(
+        {
+            "type": "forced_fallback",
+            "path": rel_norm,
+            "phase": "final_invariant",
+            "subgoal_id": state.get("subgoal_id"),
+        }
+    )
+    await EventBus.emit(
+        {
+            "type": "file_updated",
+            "file": rel_norm,
+            "workspace": ws_final,
+        }
+    )
+    await EventBus.emit(
+        {
+            "type": "agent_file_open",
+            "path": rel_norm,
+            "workspace": ws_final,
+            "subgoal_id": state.get("subgoal_id"),
+        }
+    )
+    await _emit_step_evt(
+        state,
+        phase="result",
+        step=step_index,
+        tool="file_edit",
+        action="direct_write_fallback",
+        status="success",
+        summary="final invariant main.py",
+        duration_ms=0,
+        useful=True,
+    )
+
+
 async def run_reasoning_loop(
     state: dict[str, Any],
     provider: LLMProvider,
@@ -1358,6 +1433,26 @@ async def run_reasoning_loop(
                 "the task clearly needs repo evidence.\n"
             )
 
+        goal_text_early = str(
+            state.get("subgoal_description") or state.get("react_goal") or q or ""
+        )
+        skip_llm_for_create = (
+            i == 0
+            and is_create_intent(goal_text_early)
+            and str(state.get("mode") or "").lower() == "edit"
+            and bool(state.get("write_enabled"))
+            and not bool(state.get("dry_run"))
+            and int(state.get("react_useful_steps") or 0) == 0
+            and _edit_tool_enabled(state)
+            and _goal_triggers_create_fallback(goal_text_early)
+            and not bool(state.get("_react_forced_file_edit_fallback_done"))
+            and not bool(state.get("react_low_signal_repo_probe"))
+        )
+        if skip_llm_for_create:
+            state["react_observations"].append(
+                "Create intent: skipping step-1 planner; deterministic create path runs next."
+            )
+
         user_block = (
             f"User task: {q}\n"
             f"{mode_ctrl}"
@@ -1376,11 +1471,17 @@ async def run_reasoning_loop(
         prompt = _react_system_for(state) + "\n\n" + user_block
 
         try:
-            raw = await provider.generate(
-                prompt,
-                system_prompt="Output only valid JSON for the next action.",
-                temperature=0.15,
-            )
+            if skip_llm_for_create:
+                raw = (
+                    '{"thought":"create intent (planner skipped)","tool":"file",'
+                    '"action":"list_dir","args":{"path":".","depth":1},"done":false}'
+                )
+            else:
+                raw = await provider.generate(
+                    prompt,
+                    system_prompt="Output only valid JSON for the next action.",
+                    temperature=0.15,
+                )
         except Exception as exc:
             logger.warning("ReasoningLoop LLM step failed: %s", exc)
             state["react_early_stop_reason"] = "llm_error"
@@ -1397,7 +1498,7 @@ async def run_reasoning_loop(
         step.setdefault("args", {})
         step.setdefault("done", False)
 
-        if bool(state.get("react_low_signal_repo_probe")):
+        if bool(state.get("react_low_signal_repo_probe")) and not skip_llm_for_create:
             ranked = list(state.get("_probe_search_paths") or [])
             fr = _files_read_key_set(state)
             if i == 0:
@@ -1430,6 +1531,7 @@ async def run_reasoning_loop(
             _scaf
             and max_steps >= 1
             and not bool(state.get("react_low_signal_repo_probe"))
+            and not skip_llm_for_create
         ):
             premature = (
                 not step.get("tool")
@@ -1541,9 +1643,7 @@ async def run_reasoning_loop(
             ws = str(getattr(registry, "workspace_root", "") or "").strip()
             if ws:
                 rel, fbody = _pick_fallback_write_path(goal_text, ws)
-                fl = state.setdefault("_react_fallback_allowed_edit_paths", [])
-                if rel not in fl:
-                    fl.append(rel)
+                state["_react_fallback_allowed_edit_paths"] = ["main.py"]
 
                 direct_ok, direct_err = _direct_write_fallback_file(ws, rel, fbody)
                 logger.info(
@@ -2390,6 +2490,10 @@ async def run_reasoning_loop(
 
     if not (state.get("react_early_stop_reason") or "").strip():
         state["react_early_stop_reason"] = "max_steps_exhausted"
+
+    await _finalize_create_main_invariant(
+        state, registry, str(q or ""), max(last_loop_i, 0)
+    )
 
     final_i = max(last_loop_i, 0)
     ws_merge = getattr(registry, "workspace_root", "") or ""
