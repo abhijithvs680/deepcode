@@ -1462,9 +1462,9 @@ class DeepCodeIdeApp(App):
 
         self._react_cancel_event = asyncio.Event()
         self._orchestrator_busy = True
+        self.ide_state.reset_for_new_agent_run()
         self.ide_state.ui_phase = "running"
         self.ide_state.terminal_log.clear()
-        self.ide_state.orchestrator_status_line = ""
         try:
             self.query_one("#input", IdeComposer).disabled = True
         except Exception:

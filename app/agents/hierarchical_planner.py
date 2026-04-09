@@ -230,6 +230,7 @@ def create_substate(parent_state: dict[str, Any], subgoal: Subgoal) -> dict[str,
     s["current_step"] = subgoal.description
     s["react_goal"] = subgoal.description
     s.pop("_react_fallback_used", None)
+    s.pop("_react_shell_cra_vite_alt_tried", None)
     s.pop("execution_scope", None)
 
     # Neutralize router hint so subgoals are not locked to parent's tool choice.
@@ -829,6 +830,40 @@ def has_dependency_coverage(
     return False
 
 
+def _subgoal_install_intent(description: str) -> bool:
+    d = (description or "").lower()
+    if any(
+        k in d
+        for k in (
+            "pip install",
+            "npm install",
+            "pnpm install",
+            "yarn install",
+            "install fastapi",
+            "install uvicorn",
+            "install dependencies",
+        )
+    ):
+        return True
+    if "install" in d and any(
+        x in d for x in ("package", "dep", "library", "module", "fastapi", "uvicorn")
+    ):
+        return True
+    return False
+
+
+def subgoal_had_successful_shell_run(sub_state: dict[str, Any]) -> bool:
+    for tr in sub_state.get("tool_results") or []:
+        if not isinstance(tr, dict) or not tr.get("success"):
+            continue
+        if (
+            str(tr.get("tool") or "").lower() == "shell"
+            and str(tr.get("action") or "").lower() == "run_command"
+        ):
+            return True
+    return False
+
+
 def is_create_intent(description: str) -> bool:
     """Heuristic: subgoal text implies creating/adding a new file on disk."""
     t = (description or "").lower()
@@ -880,7 +915,10 @@ def count_disk_writes_from_tool_results(sub_state: dict[str, Any]) -> int:
 def subgoal_success(
     sub_state: dict[str, Any], *, subgoal_description: str | None = None
 ) -> bool:
-    if subgoal_description and is_create_intent(subgoal_description):
+    desc = (subgoal_description or "").strip()
+    if desc and _subgoal_install_intent(desc):
+        return subgoal_had_successful_shell_run(sub_state)
+    if desc and is_create_intent(desc):
         return subgoal_had_successful_file_edit_write(sub_state)
     if sub_state.get("files_read") or sub_state.get("symbols_found"):
         return True

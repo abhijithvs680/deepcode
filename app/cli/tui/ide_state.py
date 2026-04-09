@@ -97,6 +97,17 @@ class IDEState:
                 self.open_files.insert(0, self.active_file)
             self._normalize_all_paths()
 
+    def reset_for_new_agent_run(self) -> None:
+        """Clear per-run agent UI state so a new orchestrator turn does not inherit timeline/trace."""
+        self.subgoal_timeline.clear()
+        self.trace_events.clear()
+        self.current_task.clear()
+        self.pending_shell_proposal = None
+        self.early_stop_reason = ""
+        self.last_rag_reason = ""
+        self.agent_status = {}
+        self.orchestrator_status_line = ""
+
     def log(self, line: str) -> bool:
         """Append a terminal line; returns True if oldest lines were dropped."""
         self.terminal_log.append(line)

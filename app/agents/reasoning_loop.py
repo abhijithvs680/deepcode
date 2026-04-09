@@ -141,6 +141,23 @@ def _goal_triggers_create_fallback(goal: str) -> bool:
     return False
 
 
+def _scaffold_shell_requires_attempt_before_py_fallback(q: str) -> bool:
+    """If set, do not run Python file fallback until shell.run_command appears in react_steps."""
+    return bool(scaffold_shell_hint(str(q or "")).strip())
+
+
+def _react_steps_include_shell_run(state: dict[str, Any]) -> bool:
+    for row in state.get("react_steps") or []:
+        if not isinstance(row, dict):
+            continue
+        if (
+            str(row.get("tool") or "").lower() == "shell"
+            and str(row.get("action") or "").lower() == "run_command"
+        ):
+            return True
+    return False
+
+
 def _pick_fallback_write_path(goal: str, workspace_root: str) -> tuple[str, str]:
     """Deterministic entry file for create fallback (avoids deepcode_fallback_*.py drift)."""
     _ = workspace_root  # reserved for future repo-type routing
@@ -1109,6 +1126,10 @@ async def _finalize_create_main_invariant(
         return
     if not _goal_triggers_create_fallback(goal_final):
         return
+    if _scaffold_shell_requires_attempt_before_py_fallback(
+        query_hint
+    ) and not _react_steps_include_shell_run(state):
+        return
     try:
         root = Path(ws_final).resolve()
         main_abs = (root / "main.py").resolve()
@@ -1331,6 +1352,7 @@ async def run_reasoning_loop(
     state.pop("_react_forced_fallback_commit_rel", None)
     state.pop("_react_fallback_injected_at_step", None)
     state.pop("_react_fallback_used", None)
+    state.pop("_react_shell_cra_vite_alt_tried", None)
     state["file_scores"] = dict(state.get("file_scores") or {})
     file_scores: dict[str, float] = defaultdict(float)
     last_touch_step: dict[str, int] = {}
@@ -1449,6 +1471,9 @@ async def run_reasoning_loop(
                     "FRONTEND / NODE TASK: use shell.run_command for npm/npx/vite/CRA/next "
                     "scaffolds — do not substitute a Python main.py or pip-in-subprocess "
                     "hacks unless the user explicitly asked for Python.\n"
+                    "First verify the toolchain: run `node -v` (and `npm -v`). If Node is "
+                    "missing, tell the user to install from https://nodejs.org/ — do not "
+                    "invent Python fallback files.\n"
                 )
 
         hint_extra = ""
@@ -1727,6 +1752,10 @@ async def run_reasoning_loop(
             and _edit_tool_enabled(state)
             and _goal_triggers_create_fallback(goal_text)
             and not bool(state.get("_react_forced_file_edit_fallback_done"))
+            and (
+                not _scaffold_shell_requires_attempt_before_py_fallback(q)
+                or _react_steps_include_shell_run(state)
+            )
         ):
             ws = str(getattr(registry, "workspace_root", "") or "").strip()
             if ws:
@@ -2326,6 +2355,34 @@ async def run_reasoning_loop(
                 except Exception as exc:
                     state["react_observations"].append(
                         f"Step {i}: shell retry error {exc}"
+                    )
+            if (
+                res is not None
+                and not res.success
+                and not skip_like
+                and not no_cb
+                and "create-react-app" in str(args.get("command") or "").lower()
+                and not state.get("_react_shell_cra_vite_alt_tried")
+            ):
+                state["_react_shell_cra_vite_alt_tried"] = True
+                state["react_observations"].append(
+                    f"Step {i}: CRA failed — trying Vite scaffold once as fallback."
+                )
+                alt_args: dict[str, Any] = {
+                    "command": "npm create vite@latest frontend -- --template react",
+                    "title": "Scaffold (Vite fallback after CRA)",
+                }
+                alt_args["confirm_shell_callback"] = state.get(
+                    "confirm_shell_callback"
+                )
+                alt_args["long_run_mode"] = bool(state.get("long_run_mode"))
+                try:
+                    res = await registry.execute_tool(
+                        "shell", "run_command", **alt_args
+                    )
+                except Exception as exc:
+                    state["react_observations"].append(
+                        f"Step {i}: Vite fallback shell error {exc}"
                     )
 
         if tool_name == "shell" and res is not None:
