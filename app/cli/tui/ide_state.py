@@ -201,6 +201,23 @@ class IDEState:
             )
             if len(self.trace_events) > self.max_trace_lines:
                 self.trace_events = self.trace_events[-self.max_trace_lines :]
+        elif t == "fallback_execution_failed":
+            fp = str(event.get("path") or "").replace("\\", "/").strip()
+            err = str(event.get("error") or "")[:200]
+            self.log(f"⚠ Fallback execution failed: {fp}" + (f" — {err}" if err else ""))
+            self.trace_events.append(
+                {
+                    "phase": "result",
+                    "step": int(event.get("step") or 0),
+                    "group": "fallback",
+                    "tool": "file_edit",
+                    "action": "forced_fallback",
+                    "status": "fail",
+                    "summary": (f"{fp} {err}"[:80] if err else fp[:80]),
+                }
+            )
+            if len(self.trace_events) > self.max_trace_lines:
+                self.trace_events = self.trace_events[-self.max_trace_lines :]
         elif t == "fast_path":
             r = str(event.get("reason") or "trivial_query")
             q = str(event.get("query") or "")[:160]

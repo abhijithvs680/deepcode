@@ -1431,7 +1431,17 @@ class DeepCodeIdeApp(App):
                     pass
                 self.ide_state.apply_event(event)
                 self.call_next(
-                    lambda: self._refresh_all_panels(reload_explorer=False)
+                    lambda: self._refresh_all_panels(reload_explorer=True)
+                )
+                return
+            if t == "fallback_execution_failed":
+                try:
+                    self._ev_debounce.flush_now()
+                except Exception:
+                    pass
+                self.ide_state.apply_event(event)
+                self.call_next(
+                    lambda: self._refresh_all_panels(reload_explorer=True)
                 )
                 return
             self._ev_debounce.push(event)

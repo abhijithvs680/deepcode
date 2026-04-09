@@ -762,7 +762,7 @@ async def _emit_agent_open_after_fallback_commit(
     registry: ToolRegistry,
     commit_result: Any,
 ) -> None:
-    """Open first written file in IDE when deterministic fallback was used."""
+    """Open the fallback target file in IDE after commit (stable path, not list order)."""
     if not state.get("_react_forced_file_edit_fallback_done"):
         return
     if commit_result is None or not getattr(commit_result, "success", False):
@@ -771,16 +771,29 @@ async def _emit_agent_open_after_fallback_commit(
     if not isinstance(data, dict):
         return
     ws = str(getattr(registry, "workspace_root", "") or "")
-    for p in data.get("files_written") or []:
+    written = [str(x).replace("\\", "/") for x in (data.get("files_written") or [])]
+    wset = set(written)
+    target = str(state.get("_react_forced_fallback_commit_rel") or "").replace(
+        "\\", "/"
+    ).strip()
+    if target and target in wset:
+        path_open = target
+    elif written:
+        path_open = written[0]
+    elif target:
+        path_open = target
+    else:
+        path_open = ""
+    if path_open:
         await EventBus.emit(
             {
                 "type": "agent_file_open",
-                "path": str(p).replace("\\", "/"),
+                "path": path_open,
                 "workspace": ws,
                 "subgoal_id": state.get("subgoal_id"),
             }
         )
-        break
+    state.pop("_react_forced_fallback_commit_rel", None)
 
 
 async def finalize_react_edit_session(
@@ -1114,6 +1127,8 @@ async def run_reasoning_loop(
     state.pop("_react_forced_file_edit_fallback_done", None)
     state.pop("_react_fallback_allowed_edit_paths", None)
     state.pop("_react_forced_fallback_rel_pending", None)
+    state.pop("_react_forced_fallback_commit_rel", None)
+    state.pop("_react_fallback_injected_at_step", None)
     state["file_scores"] = dict(state.get("file_scores") or {})
     file_scores: dict[str, float] = defaultdict(float)
     last_touch_step: dict[str, int] = {}
@@ -1482,6 +1497,8 @@ async def run_reasoning_loop(
                 if rel not in fl:
                     fl.append(rel)
                 state["_react_forced_fallback_rel_pending"] = rel
+                state["_react_forced_fallback_commit_rel"] = rel
+                state["_react_fallback_injected_at_step"] = i
                 state["react_observations"].append(
                     f"⚡ Forced action: staging minimal write → {rel} "
                     f"(step {i + 1}, no useful tool steps yet; will commit with subgoal)."
@@ -1902,6 +1919,34 @@ async def run_reasoning_loop(
             state["react_useful_steps"] += 1
         else:
             state["react_failed_steps"] += 1
+
+        fb_at = state.get("_react_fallback_injected_at_step")
+        if fb_at is not None and fb_at == i:
+            state.pop("_react_fallback_injected_at_step", None)
+            if not (res and res.success) or not useful:
+                rel_fb = str(state.get("_react_forced_fallback_commit_rel") or "")
+                err_s = ""
+                if res:
+                    err_s = str(res.error or "")[:400]
+                logger.warning(
+                    "ReasoningLoop: forced file_edit fallback did not succeed at step %s "
+                    "(path=%r err=%r)",
+                    i,
+                    rel_fb,
+                    err_s,
+                )
+                state["react_observations"].append(
+                    "⚠ Forced file_edit fallback did not apply — check tool result above."
+                )
+                await EventBus.emit(
+                    {
+                        "type": "fallback_execution_failed",
+                        "path": rel_fb.replace("\\", "/"),
+                        "step": i,
+                        "subgoal_id": state.get("subgoal_id"),
+                        "error": err_s,
+                    }
+                )
 
         if (
             res
