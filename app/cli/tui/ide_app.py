@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -459,6 +460,17 @@ class DeepCodeIdeApp(App):
         self._repo_path = repo_path
         if self._repo_path:
             self.sub_title = f"{settings.LLM_MODEL} | {Path(self._repo_path).name}"
+            if (
+                sys.platform == "win32"
+                and not getattr(self, "_ide_terminal_render_tip_shown", False)
+                and not os.environ.get("WT_SESSION")
+                and not (os.environ.get("TEXTUAL_RENDER") or "").strip()
+            ):
+                self._ide_terminal_render_tip_shown = True
+                self.ide_state.log(
+                    "Tip: garbled or duplicated panes? Use Windows Terminal or "
+                    "PowerShell (not legacy cmd), or set TEXTUAL_RENDER=plain."
+                )
         self._dispose_shell_worker()
         self._setup_explorer_workspace_tree()
         self._mount_chat(chatfmt.ingest_ready_banner())

@@ -849,7 +849,11 @@ def subgoal_had_successful_file_edit_write(sub_state: dict[str, Any]) -> bool:
             continue
         t = str(tr.get("tool") or "").lower()
         a = str(tr.get("action") or "").lower()
-        if t == "file_edit" and a in ("apply_search_replace", "commit_session"):
+        if t == "file_edit" and a in (
+            "apply_search_replace",
+            "commit_session",
+            "direct_write_fallback",
+        ):
             return True
     return False
 
@@ -862,7 +866,11 @@ def count_disk_writes_from_tool_results(sub_state: dict[str, Any]) -> int:
             continue
         t = str(tr.get("tool") or "").lower()
         a = str(tr.get("action") or "").lower()
-        if t == "file_edit" and a in ("apply_search_replace", "commit_session"):
+        if t == "file_edit" and a in (
+            "apply_search_replace",
+            "commit_session",
+            "direct_write_fallback",
+        ):
             n += 1
     return n
 

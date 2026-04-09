@@ -174,6 +174,13 @@ class FileEditTool(Tool):
                 )
             self.begin_session()
         rel = file_path.replace("\\", "/")
+        logger.debug(
+            "file_edit apply_search_replace rel=%r repo=%r expected_occurrences=%s dry_run=%s",
+            rel,
+            self.repo_path,
+            expected_occurrences,
+            dry_run,
+        )
         try:
             w = self._ensure_working(rel)
         except Exception as e:
@@ -221,6 +228,11 @@ class FileEditTool(Tool):
                 },
             )
         self._working[rel] = new_content
+        logger.debug(
+            "file_edit apply_search_replace staged rel=%r bytes=%s",
+            rel,
+            len(new_content),
+        )
         return ToolResult(
             tool=self.name,
             action="apply_search_replace",

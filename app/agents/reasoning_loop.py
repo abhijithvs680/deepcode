@@ -127,6 +127,35 @@ def _pick_fallback_write_path(goal: str, workspace_root: str) -> tuple[str, str]
     return "deepcode_fallback_31.py", body
 
 
+def _direct_write_fallback_file(
+    workspace_root: str, rel: str, content: str
+) -> tuple[bool, str]:
+    """
+    Write fallback content straight to disk (bypasses file_edit session / commit).
+    Returns (ok, error_message).
+    """
+    if not (workspace_root or "").strip():
+        return False, "empty workspace_root"
+    rel_n = _norm_rel_path(rel.replace("\\", "/").strip())
+    if not rel_n or rel_n.startswith("../"):
+        return False, f"invalid rel {rel!r}"
+    try:
+        root = Path(workspace_root).resolve()
+    except OSError as e:
+        return False, str(e)
+    try:
+        dest = (root / rel_n).resolve()
+        dest.relative_to(root)
+    except (OSError, ValueError) as e:
+        return False, str(e)
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(content, encoding="utf-8")
+    except OSError as e:
+        return False, str(e)
+    return True, ""
+
+
 _EXT = r"(?:py|pyw|js|mjs|cjs|ts|tsx|jsx|java|kt|kts|rs|go|rb|php|cs|fs|cpp|cc|c|h|hpp|vue)"
 _ERR_PATH_RES: tuple[re.Pattern[str], ...] = (
     re.compile(r'File "([^"]+)"', re.IGNORECASE),
@@ -822,6 +851,10 @@ async def finalize_react_edit_session(
     if not isinstance(ed, FileEditTool):
         return
     if not ed.has_active_session():
+        logger.debug(
+            "finalize_react_edit_session: skip (no active file_edit session) commit=%s",
+            commit,
+        )
         return
     stg = get_settings()
     if bool(state.get("react_edit_dry_run")) or getattr(
@@ -829,6 +862,12 @@ async def finalize_react_edit_session(
     ):
         commit = False
     allow = _edit_allow_paths(state)
+    logger.debug(
+        "finalize_react_edit_session: commit=%s pending=%s allow_paths=%s",
+        commit,
+        ed.has_pending_changes(),
+        len(allow) if allow else 0,
+    )
     try:
         if commit:
             if ed.has_pending_changes() and allow:
@@ -837,8 +876,17 @@ async def finalize_react_edit_session(
                     "commit_session",
                     allowed_files=sorted(allow)[:120],
                 )
+                d = getattr(cr, "data", None) or {}
+                logger.debug(
+                    "finalize_react_edit_session: commit_session success=%s files_written=%s",
+                    getattr(cr, "success", None),
+                    (d or {}).get("files_written") if isinstance(d, dict) else None,
+                )
                 await _emit_agent_open_after_fallback_commit(state, registry, cr)
             else:
+                logger.debug(
+                    "finalize_react_edit_session: rolling back (no pending or empty allow)"
+                )
                 await registry.execute_tool("file_edit", "rollback_session")
         elif (
             bool(getattr(stg, "REACT_EDIT_ROLLBACK_TO_CHECKPOINT", True))
@@ -1496,6 +1544,151 @@ async def run_reasoning_loop(
                 fl = state.setdefault("_react_fallback_allowed_edit_paths", [])
                 if rel not in fl:
                     fl.append(rel)
+
+                direct_ok, direct_err = _direct_write_fallback_file(ws, rel, fbody)
+                logger.info(
+                    "ReasoningLoop: create fallback direct write workspace=%r rel=%r ok=%s detail=%r",
+                    ws,
+                    rel,
+                    direct_ok,
+                    direct_err,
+                )
+
+                if direct_ok:
+                    rel_norm = _norm_rel_path(rel)
+                    state["_react_forced_file_edit_fallback_done"] = True
+                    state["react_useful_steps"] += 1
+                    state["goal_progress"] = min(
+                        1.0, float(state.get("goal_progress") or 0) + 0.12
+                    )
+                    if rel_norm and rel_norm not in state["files_read"]:
+                        state["files_read"].append(rel_norm)
+                    state["react_observations"].append(
+                        f"⚡ Forced action: wrote {rel_norm} directly "
+                        f"(step {i + 1}; bypassed file_edit staging)."
+                    )
+                    tr = ToolResult(
+                        tool="file_edit",
+                        action="direct_write_fallback",
+                        success=True,
+                        data={
+                            "file": rel_norm,
+                            "files_written": [rel_norm],
+                            "direct": True,
+                        },
+                    )
+                    state["tool_results"].append(tr.model_dump())
+                    state["react_steps"].append(
+                        {
+                            "step_index": i,
+                            "thought": (
+                                "Deterministic fallback — direct disk write "
+                                "(bypasses tool registry staging)."
+                            ),
+                            "tool": "file_edit",
+                            "action": "direct_write_fallback",
+                            "args": {"file_path": rel_norm},
+                        }
+                    )
+                    _maybe_compress_react_state(state)
+                    await _emit_step_evt(
+                        state,
+                        phase="start",
+                        step=i,
+                        tool="file_edit",
+                        action="direct_write_fallback",
+                        status="pending",
+                        args_preview=json.dumps(
+                            {"file_path": rel_norm}, default=str
+                        ),
+                    )
+                    await _emit_step_evt(
+                        state,
+                        phase="result",
+                        step=i,
+                        tool="file_edit",
+                        action="direct_write_fallback",
+                        status="success",
+                        summary="direct write",
+                        duration_ms=0,
+                        useful=True,
+                    )
+                    preview = json.dumps(tr.data, default=str)[:2000]
+                    state["react_observations"].append(
+                        f"Step {i}: file_edit.direct_write_fallback success=True data={preview}"
+                    )
+                    await EventBus.emit(
+                        {
+                            "type": "forced_fallback",
+                            "path": rel_norm,
+                            "phase": "direct",
+                            "subgoal_id": state.get("subgoal_id"),
+                        }
+                    )
+                    await EventBus.emit(
+                        {
+                            "type": "file_updated",
+                            "file": rel_norm,
+                            "workspace": ws,
+                        }
+                    )
+                    await EventBus.emit(
+                        {
+                            "type": "agent_file_open",
+                            "path": rel_norm,
+                            "workspace": ws,
+                            "subgoal_id": state.get("subgoal_id"),
+                        }
+                    )
+                    await _emit_react(
+                        state,
+                        {
+                            "type": "state",
+                            "subgoal": state.get("subgoal_id"),
+                            "step": i,
+                            "goal_progress": float(state.get("goal_progress") or 0),
+                            "files_read_count": len(state.get("files_read") or []),
+                            "useful_steps": int(state.get("react_useful_steps") or 0),
+                        },
+                    )
+                    _ac = compute_answer_confidence(state)
+                    _nfr = len(state.get("files_read") or [])
+                    _nsy = len(state.get("symbols_found") or [])
+                    await EventBus.emit(
+                        {
+                            "type": "agent_status",
+                            "confidence": _ac,
+                            "files_read": _nfr,
+                            "symbols": _nsy,
+                            "weak_grounding": _nfr < 2
+                            and _nsy == 0
+                            and _ac < 0.5,
+                            "subgoal_id": state.get("subgoal_id"),
+                            "agent_execution_phase": (
+                                "execute"
+                                if state.get("react_execution_allowed")
+                                else "explore"
+                            ),
+                        },
+                    )
+                    continue
+
+                rel_norm = _norm_rel_path(rel)
+                if direct_err:
+                    logger.warning(
+                        "ReasoningLoop: direct fallback failed; trying file_edit: %s",
+                        direct_err,
+                    )
+                    await EventBus.emit(
+                        {
+                            "type": "fallback_execution_failed",
+                            "path": rel_norm,
+                            "step": i,
+                            "subgoal_id": state.get("subgoal_id"),
+                            "error": f"direct_write:{direct_err}"[:300],
+                        }
+                    )
+
                 state["_react_forced_fallback_rel_pending"] = rel
                 state["_react_forced_fallback_commit_rel"] = rel
                 state["_react_fallback_injected_at_step"] = i
